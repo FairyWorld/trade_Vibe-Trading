@@ -5,14 +5,18 @@ treat Zerodha uniformly:
 
   get_historical_bars(symbol, *, exchange="NSE", period="1d", limit=90)
       -> {"status": "ok", "symbol": ..., "bars": [{time, open, high, low, close, volume}]}
+  get_account_snapshot() / get_positions() / get_open_orders() / get_quote(symbol)
+      -> Shoonya-shaped read envelopes (the ``service.py`` broker_sdk surface)
 
 Kite specifics handled here:
-  * interval map: project tokens (1m/5m/15m/30m/1h/4h/1d) -> Kite intervals
-    (minute/5minute/15minute/30minute/60minute/day). Kite has no 1H/4H token
-    collision, but we alias 1h->60minute, 4h->day to match the project set.
-  * Kite historical is capped at 2000 days per call and dates bars at midnight
-    IST; we paginate by chunking the [start, end] range into <=2000-day windows
-    and normalize the resulting index to UTC-naive (matching the loader).
+  * interval map: project tokens (1m/5m/15m/30m/1h/1d) -> Kite intervals
+    (minute/5minute/15minute/30minute/60minute/day). ``4h`` is rejected, not
+    aliased: Kite has no 4h interval, and returning daily candles under a 4h
+    period would silently mislabel data (fail closed, like Dhan).
+  * Kite caps each historical request at a per-interval number of days
+    (1m: 60, 5m: 100, 15m/30m: 200, 60m: 400, day: 2000); we paginate the
+    [start, end] range into cap-sized windows and normalize the resulting
+    index to UTC-naive (matching the loader).
   * Symbols: project ``RELIANCE.NS`` -> Kite ``exchange=NSE``,
     ``tradingsymbol=RELIANCE``. Token-based fetch is also supported if the
     instrument token is supplied, but the symbol form mirrors Shoonya/Dhan.
@@ -40,6 +44,9 @@ PROFILE_ENVIRONMENTS = {
 }
 
 KITE_HIST_BASE = "https://api.kite.trade"
+
+#: India Standard Time (Kite timestamps are IST).
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 _PAPER_ONLY_ERROR = (
     "Zerodha connector is paper-only: Kite exposes no runtime paper/live "
@@ -109,7 +116,9 @@ class ZerodhaConfig:
 
 _OVERRIDE_KEYS = ("api_key", "api_secret", "access_token", "profile")
 
-#: Project interval token -> Kite interval.
+#: Project interval token -> Kite interval. ``4h`` is deliberately absent:
+#: Kite has no 4h interval and aliasing it to daily would return mislabeled
+#: daily candles (fail closed instead).
 _INTERVAL_MAP = {
     "1m": "minute",
     "5m": "5minute",
@@ -117,14 +126,20 @@ _INTERVAL_MAP = {
     "30m": "30minute",
     "1h": "60minute",
     "1H": "60minute",
-    "4h": "day",
-    "4H": "day",
     "1d": "day",
     "1D": "day",
 }
 
-#: Kite caps historical pulls at 2000 calendar days per request.
-_KITE_MAX_SPAN_DAYS = 2000
+#: Kite caps each historical request at this many calendar days per interval
+#: (documented API limits; a wider span raises "interval exceeds max limit").
+_KITE_MAX_SPAN_DAYS: dict[str, int] = {
+    "minute": 60,
+    "5minute": 100,
+    "15minute": 200,
+    "30minute": 200,
+    "60minute": 400,
+    "day": 2000,
+}
 
 
 def config_path() -> Path:
@@ -182,11 +197,21 @@ def _require_kite():
 
 
 def zerodha_available() -> bool:
+    """True only when ``kiteconnect`` is importable AND credentials exist.
+
+    The ``india_broker`` loader treats the first available connector as *the*
+    broker (``_resolve_broker`` never falls through to the next one after a
+    runtime error), so an import-only check would let an unconfigured install
+    shadow a configured Shoonya/Dhan account. Mirrors the loader's documented
+    contract: available only when the SDK is importable AND a broker is
+    configured.
+    """
     try:
         _require_kite()
-        return True
     except ZerodhaDependencyError:
         return False
+    cfg = load_config()
+    return bool(cfg.api_key and cfg.access_token)
 
 
 def _public_config(cfg: ZerodhaConfig) -> dict[str, Any]:
@@ -241,6 +266,25 @@ def check_status(config: ZerodhaConfig | None = None) -> dict[str, Any]:
     return report
 
 
+def _bar_epoch(ts: Any, *, day_bar: bool) -> int | None:
+    """Epoch (UTC-naive seconds) for a Kite candle timestamp.
+
+    Kite timestamps are IST. Intraday candles are real instants, so the UTC
+    epoch is exact. Day candles are dated at midnight IST; shifting that
+    instant to UTC (18:30 the *previous* day) would relabel every daily bar
+    one calendar day early and make the loader's date-range clip drop the
+    first day of each window — so day bars keep their IST calendar date at
+    midnight UTC instead.
+    """
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is None:  # kiteconnect is tz-aware; defensive fallback
+        ts = ts.replace(tzinfo=_IST)
+    if day_bar:
+        return int(datetime(ts.year, ts.month, ts.day, tzinfo=timezone.utc).timestamp())
+    return int(ts.astimezone(timezone.utc).timestamp())
+
+
 def get_historical_bars(
     symbol: str,
     *,
@@ -249,7 +293,7 @@ def get_historical_bars(
     period: str = "1d",
     limit: int = 90,
 ) -> dict[str, Any]:
-    """Fetch historical OHLCV bars from Kite, paginated past the 2000-day cap."""
+    """Fetch historical OHLCV bars from Kite, paginated past the per-interval cap."""
     cfg = config or load_config()
     clean = symbol.strip().upper()
 
@@ -266,22 +310,32 @@ def get_historical_bars(
     except ZerodhaConfigError as exc:
         return {"status": "error", "error": str(exc), "symbol": clean}
 
-    # Build the date window: from (today - span) to today, span sized to `limit`
-    # daily bars (intraday uses a shorter window like Shoonya).
+    # Size the window to `limit` bars with 2x trading-day headroom, like the
+    # day path. Dense intervals (1m/5m/15m/30m) stay within their per-request
+    # cap: 60 days of 1m candles is already ~22k rows, and Kite's own
+    # retention for these is bounded anyway. 60minute/day paginate past their
+    # caps, so a 1h request is no longer truncated to 5 days.
     end = datetime.now(timezone.utc)
-    if interval == "day":
-        start = end - timedelta(days=min(limit * 2, 4000))
-    else:
-        start = end - timedelta(days=5)
+    cap = _KITE_MAX_SPAN_DAYS[interval]
+    window = min(limit * 2, 4000)
+    if interval in ("minute", "5minute", "15minute", "30minute"):
+        window = min(window, cap)
+    start = end - timedelta(days=window)
+
+    # Resolve the instrument token once (the exchange dump is cached).
+    try:
+        token = _symbol_to_token(kite, clean, exchange)
+    except ZerodhaConfigError as exc:
+        return {"status": "error", "error": str(exc), "symbol": clean}
 
     bars: list[dict[str, Any]] = []
-    # Paginate in <=2000-day chunks (Kite hard cap).
+    # Paginate in per-interval chunks (Kite hard cap per request).
     chunk_start = start
     while chunk_start < end:
-        chunk_end = min(chunk_start + timedelta(days=_KITE_MAX_SPAN_DAYS), end)
+        chunk_end = min(chunk_start + timedelta(days=cap), end)
         try:
             rows = kite.historical_data(
-                instrument_token=_symbol_to_token(kite, clean, exchange),
+                instrument_token=token,
                 from_date=chunk_start,
                 to_date=chunk_end,
                 interval=interval,
@@ -289,21 +343,20 @@ def get_historical_bars(
         except Exception as exc:  # noqa: BLE001 — one bad symbol never aborts
             return {"status": "error", "error": str(exc), "symbol": clean}
         for r in rows:
-            ts = r.get("date")
-            if ts is None:
+            ts_epoch = _bar_epoch(r.get("date"), day_bar=(interval == "day"))
+            if ts_epoch is None:
                 continue
-            # Kite returns tz-aware datetimes (IST); normalize to UTC-naive.
-            if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-                ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
             bars.append({
-                "time": int(ts.timestamp()),
+                "time": ts_epoch,
                 "open": float(r.get("open", 0)),
                 "high": float(r.get("high", 0)),
                 "low": float(r.get("low", 0)),
                 "close": float(r.get("close", 0)),
                 "volume": int(r.get("volume", 0)),
             })
-        chunk_start = chunk_end
+        # Kite's from/to dates are inclusive; advance a full day so the
+        # boundary candle is not fetched twice by the next chunk.
+        chunk_start = chunk_end + timedelta(days=1)
 
     if not bars:
         return {"status": "ok", "symbol": clean, "exchange": exchange, "period": period, "bars": []}
@@ -316,13 +369,28 @@ def get_historical_bars(
     }
 
 
+#: Kite's full instrument list per exchange, cached per process. The dump is
+#: large (tens of MB) and static within a session; re-downloading it on every
+#: bar fetch would dominate the read path.
+_INSTRUMENT_CACHE: dict[str, tuple[dict[str, Any], ...]] = {}
+
+
 def _symbol_to_token(kite, symbol: str, exchange: str) -> int:
-    """Resolve a tradingsymbol+exchange to an instrument token via Kite's
-    instruments list (cached per process). Falls back to a name-based search."""
-    try:
-        instruments = kite.instruments(exchange=exchange)
-    except Exception:
-        instruments = []
+    """Resolve a tradingsymbol+exchange to an instrument token.
+
+    The instrument list is fetched once per exchange and cached for the
+    process. A cache miss surfaces the real API error instead of masquerading
+    as "token not found".
+    """
+    instruments = _INSTRUMENT_CACHE.get(exchange)
+    if instruments is None:
+        try:
+            instruments = tuple(kite.instruments(exchange=exchange) or ())
+        except Exception as exc:
+            raise ZerodhaConfigError(
+                f"failed to fetch {exchange} instrument list: {exc}"
+            ) from exc
+        _INSTRUMENT_CACHE[exchange] = instruments
     for inst in instruments:
         if inst.get("tradingsymbol", "").upper() == symbol.upper():
             return int(inst["instrument_token"])
@@ -361,14 +429,137 @@ def get_quote(
     }
 
 
+def _num(value: Any, default: float = 0.0) -> float:
+    """Coerce a Kite API field to float, tolerating None/empty strings."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def get_account_snapshot(config: ZerodhaConfig | None = None) -> dict[str, Any]:
+    """Read fund/margin summary from Kite (equity segment)."""
+    cfg = config or load_config()
+    try:
+        kite = _login(cfg)
+        margins = kite.margins()
+    except ZerodhaConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — one bad read never aborts
+        return {"status": "error", "error": str(exc)}
+    equity = margins.get("equity", {}) if isinstance(margins, dict) else {}
+    available = equity.get("available", {}) or {}
+    utilised = equity.get("utilised", {}) or {}
+    return {
+        "status": "ok",
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "host": KITE_HIST_BASE,
+        "brokerage": "Zerodha equity delivery ₹0; intraday 0.03% / ₹20 flat",
+        "account": {
+            "currency": "INR",
+            "cash": _num(available.get("cash")),
+            "margin_available": _num(equity.get("net")),
+            "margin_used": _num(utilised.get("margins")),
+            "collateral": _num(available.get("collateral")),
+            "payin": _num(available.get("intraday_payin")),
+        },
+    }
+
+
+def get_positions(config: ZerodhaConfig | None = None) -> dict[str, Any]:
+    """Read open (net) positions from Kite."""
+    cfg = config or load_config()
+    try:
+        kite = _login(cfg)
+        positions = kite.positions()
+    except ZerodhaConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — one bad read never aborts
+        return {"status": "error", "error": str(exc)}
+    raw = positions.get("net", []) if isinstance(positions, dict) else positions
+    rows = []
+    for item in _as_list(raw):
+        rows.append({
+            "symbol": item.get("tradingsymbol", ""),
+            "exchange": item.get("exchange", ""),
+            "product_type": item.get("product", ""),
+            "quantity": int(_num(item.get("quantity", 0))),
+            "average_cost": _num(item.get("average_price", 0)),
+            "ltp": _num(item.get("last_price", 0)),
+            "unrealized_pnl": _num(item.get("unrealised", 0)),
+            "realized_pnl": _num(item.get("realised", 0)),
+            "overnight_quantity": int(_num(item.get("overnight_quantity", 0))),
+            "multiplier": _num(item.get("multiplier", 1)),
+        })
+    return {"status": "ok", "profile": cfg.profile, "is_paper": cfg.is_paper, "positions": rows}
+
+
+def get_open_orders(
+    config: ZerodhaConfig | None = None,
+    *,
+    include_executions: bool = False,
+) -> dict[str, Any]:
+    """Read the Kite order book; open orders, optionally executions."""
+    cfg = config or load_config()
+    try:
+        kite = _login(cfg)
+        orders = kite.orders()
+    except ZerodhaConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — one bad read never aborts
+        return {"status": "error", "error": str(exc)}
+    open_orders: list[dict[str, Any]] = []
+    executions: list[dict[str, Any]] = []
+    for item in _as_list(orders):
+        status = str(item.get("status", "")).upper()
+        order = {
+            "order_id": item.get("order_id", ""),
+            "symbol": item.get("tradingsymbol", ""),
+            "exchange": item.get("exchange", ""),
+            "side": "buy" if str(item.get("transaction_type", "")).upper() == "BUY" else "sell",
+            "order_type": str(item.get("order_type", "")).lower(),
+            "quantity": int(_num(item.get("quantity", 0))),
+            "filled_qty": int(_num(item.get("filled_quantity", 0))),
+            "price": _num(item.get("price", 0)),
+            "status": item.get("status", ""),
+            "product_type": item.get("product", ""),
+        }
+        if status in ("OPEN", "PENDING", "TRIGGER_PENDING"):
+            open_orders.append(order)
+        elif include_executions and status in ("COMPLETE", "FILLED"):
+            executions.append(order)
+    result: dict[str, Any] = {
+        "status": "ok",
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "open_orders": open_orders,
+    }
+    if include_executions:
+        result["executions"] = executions
+    return result
+
+
 def place_order(
     config: ZerodhaConfig | None = None,
     *,
     symbol: str,
     side: str,
     quantity: float | None = None,
+    notional: float | None = None,
     order_type: str = "market",
     limit_price: float | None = None,
+    time_in_force: str = "day",
     exchange: str = "NSE",
     product_type: str = "C",
 ) -> dict[str, Any]:
@@ -381,6 +572,10 @@ def place_order(
     cfg = config or load_config()
     if not cfg.is_paper:
         return {"status": "error", "error": _PAPER_ONLY_ERROR}
+
+    # ``notional`` and ``time_in_force`` are part of the uniform service.py
+    # surface but meaningless for a locally simulated paper fill.
+    del notional, time_in_force
 
     clean_symbol = str(symbol or "").strip().upper()
     if not clean_symbol:
@@ -410,4 +605,34 @@ def place_order(
         "order_status": "simulated_fill",
         "exchange": exchange,
         "product_type": product_type,
+    }
+
+
+def cancel_order(
+    config: ZerodhaConfig | None = None,
+    order_id: str = "",
+    *,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Cancel a PAPER-ONLY order (simulated locally).
+
+    Kite exposes no sandbox, so like ``place_order`` this is structurally
+    capped at paper: the very first check refuses any non-paper config, and a
+    cancel is a local simulation, never a live API call.
+    """
+    cfg = config or load_config()
+    if not cfg.is_paper:
+        return {"status": "error", "error": _PAPER_ONLY_ERROR}
+
+    clean_id = str(order_id or "").strip()
+    if not clean_id:
+        return {"status": "error", "error": "order_id is required"}
+
+    return {
+        "status": "ok",
+        "order_id": clean_id,
+        "symbol": symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else None,
+        "profile": cfg.profile,
+        "is_paper": True,
+        "cancelled": True,
     }
