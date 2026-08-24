@@ -29,6 +29,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping
 from urllib.parse import urlparse
+from urllib.request import getproxies
 
 from src.config.paths import get_runtime_root
 
@@ -288,30 +289,63 @@ def get_account_snapshot(config: BinanceConfig | None = None) -> dict[str, Any]:
 def get_positions(config: BinanceConfig | None = None) -> dict[str, Any]:
     """Fetch holdings shaped as positions for the configured account.
 
-    Binance spot has no positions; holdings are the non-zero balances. Each row
-    is ``{symbol, quantity, free, used}`` where ``symbol`` is the asset code and
-    ``quantity`` is the total balance.
+    Binance spot has no positions; holdings are the non-zero balances. On live
+    accounts Binance may expose Simple Earn Flexible collateral in the spot
+    payload as synthetic ``LD<ASSET>`` balances. When the read-only Simple Earn
+    endpoint is available, replace those wrappers with their underlying asset
+    and authoritative ``totalAmount`` so portfolio valuation neither misses nor
+    double-counts flexible holdings.
     """
     cfg = config or load_config()
     _assert_host(cfg)
     ex = _exchange(cfg)
     balance = ex.fetch_balance()
+    spot_balances = _nonzero_balances(balance)
+    earn_rows: list[dict[str, Any]] = []
+    earn_wrappers: set[str] = set()
+    earn_note: str | None = None
+    if not cfg.is_testnet:
+        try:
+            payload = ex.sapi_get_simple_earn_flexible_position({"size": 100})
+            for item in payload.get("rows", []) if isinstance(payload, Mapping) else []:
+                asset = str(_obj_get(item, "asset", "")).strip().upper()
+                quantity = _to_float(_obj_get(item, "totalAmount"))
+                if not asset or not quantity:
+                    continue
+                earn_wrappers.add(f"LD{asset}")
+                earn_rows.append(
+                    {
+                        "symbol": asset,
+                        "quantity": quantity,
+                        "free": 0.0,
+                        "used": quantity,
+                        "source": "simple_earn_flexible",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - spot holdings still remain usable
+            earn_note = f"Simple Earn Flexible holdings unavailable: {type(exc).__name__}"
+
     rows = [
         {
             "symbol": _obj_get(row, "asset"),
             "quantity": _obj_get(row, "total"),
             "free": _obj_get(row, "free"),
             "used": _obj_get(row, "used"),
+            "source": "spot",
         }
-        for row in _nonzero_balances(balance)
-    ]
-    return {
+        for row in spot_balances
+        if str(_obj_get(row, "asset", "")).upper() not in earn_wrappers
+    ] + earn_rows
+    result = {
         "status": "ok",
         "profile": cfg.profile,
         "is_testnet": cfg.is_testnet,
         "paper_guard": "host_separated",
         "positions": rows,
     }
+    if earn_note:
+        result["note"] = earn_note
+    return result
 
 
 def get_open_orders(config: BinanceConfig | None = None, *, include_executions: bool = False) -> dict[str, Any]:
@@ -628,14 +662,33 @@ def _symbol_required_errors() -> tuple[type[BaseException], ...]:
 def _exchange(cfg: BinanceConfig):
     """Build a ccxt ``binance`` client bound to the configured environment."""
     ccxt = _require_ccxt()
-    ex = ccxt.binance(
-        {
-            "apiKey": cfg.api_key,
-            "secret": cfg.api_secret,
-            "enableRateLimit": True,
-            "timeout": int(cfg.timeout * 1000),
-        }
-    )
+    client_config: dict[str, Any] = {
+        "apiKey": cfg.api_key,
+        "secret": cfg.api_secret,
+        "enableRateLimit": True,
+        "timeout": int(cfg.timeout * 1000),
+        # Signed Binance requests have a narrow timestamp window. Let ccxt
+        # measure the exchange clock before the first private request so a
+        # sleeping laptop or an imperfect system clock does not force users to
+        # reconnect or recreate an otherwise valid read-only API key.
+        "options": {
+            "adjustForTimeDifference": True,
+            "recvWindow": 10_000,
+        },
+    }
+    # ``requests``/ccxt does not consistently inherit the macOS System Proxy.
+    # urllib resolves both conventional proxy environment variables and the
+    # active macOS network proxy, so local desktop connectors follow the same
+    # route as the user's browser without persisting proxy details or secrets.
+    system_proxies = getproxies()
+    proxies = {
+        scheme: str(system_proxies[scheme]).strip()
+        for scheme in ("http", "https")
+        if str(system_proxies.get(scheme) or "").strip()
+    }
+    if proxies:
+        client_config["proxies"] = proxies
+    ex = ccxt.binance(client_config)
     ex.set_sandbox_mode(cfg.is_testnet)
     return ex
 

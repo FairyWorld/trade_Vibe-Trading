@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.quantlib.valuation.contracts import MissingInputError
+from src.quantlib.valuation.contracts import MissingInputError, ValuationError
 from src.quantlib.valuation.threestatement import (
     MAX_CIRCULARITY_ITERATIONS,
     BalanceSheet,
@@ -311,6 +311,52 @@ def test_check_balance_sheet_does_not_raise_when_balanced():
         retained_earnings=1_200.0,
     )
     check_balance_sheet(balanced)  # must not raise
+
+
+def test_check_balance_sheet_raises_on_non_finite_assets():
+    """A NaN asset makes the residual non-finite, which must not pass the check."""
+    sheet = BalanceSheet(
+        period=1,
+        cash=float("nan"),
+        net_working_capital=200.0,
+        ppe=3_000.0,
+        revolver_balance=1_000.0,
+        paid_in_capital=2_000.0,
+        retained_earnings=1_200.0,
+    )
+    with pytest.raises(BalanceSheetError):
+        check_balance_sheet(sheet)
+
+
+def test_check_balance_sheet_raises_on_infinite_equity():
+    """An infinite equity value must not pass the balance check."""
+    sheet = BalanceSheet(
+        period=1,
+        cash=1_000.0,
+        net_working_capital=200.0,
+        ppe=3_000.0,
+        revolver_balance=1_000.0,
+        paid_in_capital=float("inf"),
+        retained_earnings=1_200.0,
+    )
+    with pytest.raises(BalanceSheetError):
+        check_balance_sheet(sheet)
+
+
+def test_project_three_statement_refuses_non_finite_driver():
+    """A NaN driver must fail with a clear non-finite error, not a misleading
+    ConvergenceError."""
+    bad_drivers = dict(DRIVERS)
+    bad_drivers["revenue_growth"] = [float("nan"), 0.08, 0.05]
+    with pytest.raises(ValuationError):
+        project_three_statement(OPENING, bad_drivers)
+
+
+def test_project_three_statement_refuses_non_finite_opening():
+    bad_opening = dict(OPENING)
+    bad_opening["revenue"] = float("inf")
+    with pytest.raises(ValuationError):
+        project_three_statement(bad_opening, DRIVERS)
 
 
 def test_project_three_statement_raises_on_broken_opening_balance_sheet():

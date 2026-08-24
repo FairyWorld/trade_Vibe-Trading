@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 from src.quantlib.options import (
+    BARRIER_TYPES,
+    barrier_option_price,
     bs_greeks,
     bs_price,
     implied_volatility,
+    normalise_barrier_type,
     normalise_option_type,
 )
 
@@ -499,3 +503,70 @@ def test_an_aliased_leg_prices_and_settles_as_the_same_side():
         deep_itm = bs_price(200, 100, 0.01, 0.0, 0.2, alias) if folded == "call" else \
             bs_price(50, 100, 0.01, 0.0, 0.2, alias)
         assert deep_itm > 45.0
+
+
+# --------------------------------------------------------------------------
+# Barrier Options Tests
+# --------------------------------------------------------------------------
+
+
+class TestBarrierOptions:
+    """Analytical barrier option pricing tests and In-Out parity checks."""
+
+    @pytest.mark.parametrize(
+        ("S", "K", "H_down", "H_up", "T", "r", "sigma", "q"),
+        [
+            (100.0, 100.0, 90.0, 110.0, 0.5, 0.05, 0.25, 0.02),
+            (100.0, 95.0, 85.0, 115.0, 1.0, 0.03, 0.20, 0.0),
+            (100.0, 105.0, 90.0, 120.0, 0.75, 0.04, 0.30, 0.03),
+        ],
+    )
+    def test_in_out_parity_zero_rebate(self, S, K, H_down, H_up, T, r, sigma, q):
+        # Call options
+        vanilla_call = bs_price(S, K, T, r, sigma, "call", q=q)
+        doc = barrier_option_price(S, K, H_down, T, r, sigma, "down-and-out", "call", q=q)
+        dic = barrier_option_price(S, K, H_down, T, r, sigma, "down-and-in", "call", q=q)
+        assert doc + dic == pytest.approx(vanilla_call, rel=1e-5)
+
+        uoc = barrier_option_price(S, K, H_up, T, r, sigma, "up-and-out", "call", q=q)
+        uic = barrier_option_price(S, K, H_up, T, r, sigma, "up-and-in", "call", q=q)
+        assert uoc + uic == pytest.approx(vanilla_call, rel=1e-5)
+
+        # Put options
+        vanilla_put = bs_price(S, K, T, r, sigma, "put", q=q)
+        dop = barrier_option_price(S, K, H_down, T, r, sigma, "down-and-out", "put", q=q)
+        dip = barrier_option_price(S, K, H_down, T, r, sigma, "down-and-in", "put", q=q)
+        assert dop + dip == pytest.approx(vanilla_put, rel=1e-5)
+
+        uop = barrier_option_price(S, K, H_up, T, r, sigma, "up-and-out", "put", q=q)
+        uip = barrier_option_price(S, K, H_up, T, r, sigma, "up-and-in", "put", q=q)
+        assert uop + uip == pytest.approx(vanilla_put, rel=1e-5)
+
+    def test_in_out_parity_with_rebate(self):
+        S, K, H, T, r, sigma, q, rebate = 100.0, 100.0, 90.0, 0.5, 0.05, 0.25, 0.0, 5.0
+        vanilla_call = bs_price(S, K, T, r, sigma, "call", q=q)
+        doc = barrier_option_price(S, K, H, T, r, sigma, "down-and-out", "call", q=q, rebate=rebate)
+        dic = barrier_option_price(S, K, H, T, r, sigma, "down-and-in", "call", q=q, rebate=rebate)
+        expected_sum = vanilla_call + rebate * np.exp(-r * T)
+        assert doc + dic == pytest.approx(expected_sum, rel=1e-5)
+
+    def test_already_breached_barrier_behavior(self):
+        # Down-and-out when S <= H is knocked out immediately
+        assert barrier_option_price(85.0, 100.0, 90.0, 0.5, 0.05, 0.20, "down-and-out", "call", rebate=3.0) == pytest.approx(
+            3.0 * np.exp(-0.05 * 0.5)
+        )
+        # Down-and-in when S <= H is already knocked in -> vanilla price
+        vanilla = bs_price(85.0, 100.0, 0.5, 0.05, 0.20, "call")
+        assert barrier_option_price(85.0, 100.0, 90.0, 0.5, 0.05, 0.20, "down-and-in", "call") == pytest.approx(
+            vanilla
+        )
+
+    def test_barrier_option_input_validation(self):
+        with pytest.raises(ValueError, match="strictly positive"):
+            barrier_option_price(-100.0, 100.0, 90.0, 1.0, 0.05, 0.2, "down-and-out")
+        with pytest.raises(ValueError, match="strictly positive"):
+            barrier_option_price(100.0, -100.0, 90.0, 1.0, 0.05, 0.2, "down-and-out")
+        with pytest.raises(ValueError, match="strictly positive"):
+            barrier_option_price(100.0, 100.0, -90.0, 1.0, 0.05, 0.2, "down-and-out")
+        with pytest.raises(ValueError, match="unknown barrier type"):
+            barrier_option_price(100.0, 100.0, 90.0, 1.0, 0.05, 0.2, "invalid-barrier")

@@ -17,6 +17,7 @@ from src.quantlib.crossvalidation import (
     Split,
     combinatorial_purged_splits,
     detect_boundary_leakage,
+    group_purged_kfold_splits,
     purged_kfold_splits,
     purged_walk_forward_splits,
 )
@@ -311,3 +312,44 @@ def test_purge_counts_are_reported_not_hidden():
     for split in purged_kfold_splits(n, labels, n_folds=5):
         removed = n - split.train.size - split.test.size
         assert split.purged + split.embargoed == removed
+
+# --------------------------------------------------------------------------
+# group_purged_kfold_splits
+# --------------------------------------------------------------------------
+
+
+def test_group_purged_kfold_splits_prevents_cross_sectional_leakage():
+    # 10 assets x 100 dates = 1000 observations
+    n_dates = 100
+    n_assets = 10
+    dates = np.repeat(np.arange(n_dates), n_assets)
+
+    splits = list(group_purged_kfold_splits(dates, n_folds=5, embargo_fraction=0.05))
+    assert len(splits) == 5
+
+    for split in splits:
+        # 1. No shared row indices
+        assert len(np.intersect1d(split.train, split.test)) == 0
+
+        # 2. No shared dates between train and test
+        train_dates = set(dates[split.train])
+        test_dates = set(dates[split.test])
+        assert train_dates.intersection(test_dates) == set()
+
+        # 3. Exactly n_assets * number of test dates in test set
+        assert len(split.test) == len(test_dates) * n_assets
+
+        # 4. Embargo is applied to subsequent dates
+        test_max_date = max(test_dates)
+        embargo_expected_end = test_max_date + int(round(n_dates * 0.05))
+        for d in range(test_max_date + 1, min(n_dates, embargo_expected_end)):
+            assert d not in train_dates
+
+
+def test_group_purged_kfold_splits_input_validation():
+    with pytest.raises(ValueError, match="at least 2"):
+        list(group_purged_kfold_splits([1, 1, 2, 2], n_folds=1))
+    with pytest.raises(ValueError, match="cannot make 5 folds"):
+        list(group_purged_kfold_splits([1, 1, 2, 2], n_folds=5))
+    with pytest.raises(ValueError, match="groups array cannot be empty"):
+        list(group_purged_kfold_splits([], n_folds=2))

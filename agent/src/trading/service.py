@@ -40,6 +40,38 @@ def _sdk_module(connector: str):
     return importlib.import_module(path)
 
 
+def _local_plugin_call(
+    profile: TradingProfile,
+    operation: str,
+    overrides: dict[str, Any],
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Call a read operation on a user-installed local connector adapter."""
+    from src.trading.connections import ConnectionStore, credential_fields
+    from src.trading.local_plugins import load_adapter, plugin_by_profile_id
+
+    connection_id = str(overrides.get("connection_id") or "").strip().lower()
+    if not connection_id:
+        raise ValueError("local connector plugins require a connection_id")
+    store = ConnectionStore()
+    connection = store.get(connection_id)
+    if connection.profile_id != profile.id:
+        raise ValueError("local connection profile does not match the requested plugin")
+    plugin = plugin_by_profile_id(profile.id)
+    adapter = load_adapter(plugin)
+    function = getattr(adapter, operation, None)
+    if not callable(function):
+        return _unsupported(profile, operation)
+    credentials = store.credentials.load(connection.id, credential_fields(profile.id))
+    return function(
+        *args,
+        credentials=credentials,
+        config=dict(profile.config),
+        **kwargs,
+    )
+
+
 def check_connection(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
     """Check a connector profile without mutating broker state."""
     profile = profile_by_id(profile_id)
@@ -63,6 +95,10 @@ def check_connection(profile_id: str | None = None, **overrides: Any) -> dict[st
         report["transport"] = profile.transport
         return report
 
+    if profile.transport == "local_plugin":
+        report = _local_plugin_call(profile, "check_status", overrides)
+        return _with_profile(profile, report)
+
     return _remote_status(profile)
 
 
@@ -76,7 +112,17 @@ def get_account(profile_id: str | None = None, **overrides: Any) -> dict[str, An
     if profile.transport == "broker_sdk":
         module = _sdk_module(profile.connector)
         return _with_profile(profile, module.get_account_snapshot(module.build_config(profile.config, overrides)))
-    return _call_remote(profile, "account", _account_arg(overrides))
+    if profile.transport == "local_plugin":
+        return _with_profile(
+            profile,
+            _local_plugin_call(profile, "get_account_snapshot", overrides),
+        )
+    return _call_remote(
+        profile,
+        "account",
+        _account_arg(overrides),
+        interactive_oauth=bool(overrides.get("interactive_oauth", True)),
+    )
 
 
 def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
@@ -89,7 +135,17 @@ def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, 
     if profile.transport == "broker_sdk":
         module = _sdk_module(profile.connector)
         return _with_profile(profile, module.get_positions(module.build_config(profile.config, overrides)))
-    return _call_remote(profile, "positions", _account_arg(overrides))
+    if profile.transport == "local_plugin":
+        return _with_profile(
+            profile,
+            _local_plugin_call(profile, "get_positions", overrides),
+        )
+    return _call_remote(
+        profile,
+        "positions",
+        _account_arg(overrides),
+        interactive_oauth=bool(overrides.get("interactive_oauth", True)),
+    )
 
 
 def get_open_orders(
@@ -113,6 +169,16 @@ def get_open_orders(
             profile,
             module.get_open_orders(
                 module.build_config(profile.config, overrides), include_executions=include_executions
+            ),
+        )
+    if profile.transport == "local_plugin":
+        return _with_profile(
+            profile,
+            _local_plugin_call(
+                profile,
+                "get_open_orders",
+                overrides,
+                include_executions=include_executions,
             ),
         )
     return _call_remote(profile, "orders", _account_arg(overrides))
@@ -145,6 +211,11 @@ def get_quote(
     if profile.transport == "broker_sdk":
         module = _sdk_module(profile.connector)
         return _with_profile(profile, module.get_quote(symbol, config=module.build_config(profile.config, overrides)))
+    if profile.transport == "local_plugin":
+        return _with_profile(
+            profile,
+            _local_plugin_call(profile, "get_quote", overrides, symbol),
+        )
     return _call_remote(profile, "quote", {"symbols": [symbol], "symbol": symbol})
 
 
@@ -154,6 +225,8 @@ def search_instruments(
     *,
     limit: int = 10,
     mode: str = "auto",
+    instrument_type_id: int | None = None,
+    include_rates: bool = False,
     **overrides: Any,
 ) -> dict[str, Any]:
     """Search tradable instruments (eToro Public API)."""
@@ -168,6 +241,8 @@ def search_instruments(
             module.build_config(profile.config, overrides),
             limit=limit,
             mode=mode,
+            instrument_type_id=instrument_type_id,
+            include_rates=include_rates,
         ),
     )
 
@@ -223,7 +298,193 @@ def get_history(
                 limit=limit,
             ),
         )
+    if profile.transport == "local_plugin":
+        return _with_profile(
+            profile,
+            _local_plugin_call(
+                profile,
+                "get_historical_bars",
+                overrides,
+                symbol,
+                period=period,
+                limit=limit,
+            ),
+        )
     return _unsupported(profile, "history.read")
+
+
+# ---------------------------------------------------------------------------
+# Extended read-only data: rehab, capital flow, history deals, earnings
+# calendar, financials, and account cash flow. These unlock fundamental
+# analysis, attribution, and shadow-account workflows for connectors that
+# expose them. Other SDK connectors fall back to a clean "unsupported"
+# response when the corresponding SDK function is absent.
+# ---------------------------------------------------------------------------
+
+
+def get_rehab(symbol: str, profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
+    """Dividend / split adjustment factors for ``symbol``."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "rehab.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_rehab", None)
+    if fn is None:
+        return _unsupported(profile, "rehab.read")
+    return _with_profile(
+        profile,
+        fn(symbol, config=module.build_config(profile.config, overrides)),
+    )
+
+
+def get_capital_flow(
+    symbol: str,
+    profile_id: str | None = None,
+    *,
+    period_type: str = "INTRADAY",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Historical main-flow time series for ``symbol``."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "capital_flow.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_capital_flow", None)
+    if fn is None:
+        return _unsupported(profile, "capital_flow.read")
+    return _with_profile(
+        profile,
+        fn(
+            symbol,
+            config=module.build_config(profile.config, overrides),
+            period_type=period_type,
+        ),
+    )
+
+
+def get_capital_distribution(
+    symbol: str, profile_id: str | None = None, **overrides: Any
+) -> dict[str, Any]:
+    """Latest capital in-flow vs out-flow snapshot for ``symbol``."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "capital_distribution.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_capital_distribution", None)
+    if fn is None:
+        return _unsupported(profile, "capital_distribution.read")
+    return _with_profile(
+        profile,
+        fn(symbol, config=module.build_config(profile.config, overrides)),
+    )
+
+
+def get_history_deals(
+    start: str,
+    end: str,
+    profile_id: str | None = None,
+    *,
+    code: str = "",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Historical FILL records for shadow-account analysis."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "history_deals.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_history_deals", None)
+    if fn is None:
+        return _unsupported(profile, "history_deals.read")
+    return _with_profile(
+        profile,
+        fn(
+            start,
+            end,
+            config=module.build_config(profile.config, overrides),
+            code=code,
+        ),
+    )
+
+
+def get_acc_cash_flow(
+    clearing_date: str,
+    profile_id: str | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Account cash-flow movements for ``clearing_date`` (YYYY-MM-DD)."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "acc_cash_flow.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_acc_cash_flow", None)
+    if fn is None:
+        return _unsupported(profile, "acc_cash_flow.read")
+    return _with_profile(
+        profile,
+        fn(
+            clearing_date,
+            config=module.build_config(profile.config, overrides),
+        ),
+    )
+
+
+def get_financials(
+    symbol: str,
+    profile_id: str | None = None,
+    *,
+    statement_type: str = "INCOME",
+    num: int = 20,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Financial statements (income / balance / cash flow) for ``symbol``."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "financials.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_financials", None)
+    if fn is None:
+        return _unsupported(profile, "financials.read")
+    return _with_profile(
+        profile,
+        fn(
+            symbol,
+            config=module.build_config(profile.config, overrides),
+            statement_type=statement_type,
+            num=num,
+        ),
+    )
+
+
+def get_earnings_calendar(
+    profile_id: str | None = None,
+    *,
+    market: str = "US",
+    begin_date: str = "",
+    end_date: str = "",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Upcoming earnings calendar for ``market`` (US / HK)."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "earnings_calendar.read")
+    module = _sdk_module(profile.connector)
+    fn = getattr(module, "get_earnings_calendar", None)
+    if fn is None:
+        return _unsupported(profile, "earnings_calendar.read")
+    return _with_profile(
+        profile,
+        fn(
+            config=module.build_config(profile.config, overrides),
+            market=market,
+            begin_date=begin_date,
+            end_date=end_date,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# End extended read-only data section.
+# ---------------------------------------------------------------------------
 
 
 #: Connector → (instrument type, fixed asset class | None). ``None`` asset class
@@ -417,6 +678,21 @@ def _route_sdk_write(
 def _etoro_error(message: str) -> dict[str, Any]:
     """Return a connector-shaped fail-closed error before any broker write."""
     return {"status": "error", "error": message}
+
+
+def _etoro_copy_unavailable_on_paper(profile: TradingProfile) -> dict[str, Any] | None:
+    if profile.environment != "paper":
+        return None
+    from src.trading.connectors.etoro.copy_trading import COPY_TRADING_PAPER_UNSUPPORTED
+
+    return _with_profile(
+        profile,
+        {
+            "status": "error",
+            "error": COPY_TRADING_PAPER_UNSUPPORTED,
+            "error_code": "copy_unavailable_on_paper",
+        },
+    )
 
 
 def _close_etoro_position(
@@ -652,6 +928,9 @@ def etoro_copy_precheck(
     profile = profile_by_id(profile_id)
     if profile.connector != "etoro":
         return _unsupported_etoro(profile, "copy.precheck")
+    blocked = _etoro_copy_unavailable_on_paper(profile)
+    if blocked is not None:
+        return blocked
     module = _sdk_module(profile.connector)
     config = module.build_config(profile.config, overrides)
     return _with_profile(
@@ -678,6 +957,9 @@ def etoro_copy_start(
     profile = profile_by_id(profile_id)
     if profile.connector != "etoro":
         return _unsupported_etoro(profile, "copy.start")
+    blocked = _etoro_copy_unavailable_on_paper(profile)
+    if blocked is not None:
+        return blocked
     overrides = dict(overrides)
     overrides.pop("session_id", None)
     module = _sdk_module(profile.connector)
@@ -756,6 +1038,9 @@ def etoro_copy_poll(
     profile = profile_by_id(profile_id)
     if profile.connector != "etoro":
         return _unsupported_etoro(profile, "copy.poll")
+    blocked = _etoro_copy_unavailable_on_paper(profile)
+    if blocked is not None:
+        return blocked
     module = _sdk_module(profile.connector)
     config = module.build_config(profile.config, overrides)
     return _with_profile(profile, module.copy_poll(config, reference_id=reference_id, request_id=request_id))
@@ -773,6 +1058,9 @@ def etoro_copy_close(
     profile = profile_by_id(profile_id)
     if profile.connector != "etoro":
         return _unsupported_etoro(profile, "copy.close")
+    blocked = _etoro_copy_unavailable_on_paper(profile)
+    if blocked is not None:
+        return blocked
     overrides = dict(overrides)
     overrides.pop("session_id", None)
     module = _sdk_module(profile.connector)
@@ -936,8 +1224,30 @@ def _account_arg(overrides: dict[str, Any]) -> dict[str, Any]:
     return {"account_number": account} if account else {}
 
 
-def _call_remote(profile: TradingProfile, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Call a known read operation on a remote MCP connector profile."""
+def _call_remote(
+    profile: TradingProfile,
+    operation: str,
+    arguments: dict[str, Any],
+    *,
+    interactive_oauth: bool = True,
+) -> dict[str, Any]:
+    """Call a known read operation on a remote MCP connector profile.
+
+    Args:
+        profile: Connector profile whose ``transport`` is a remote MCP server.
+        operation: Logical read operation ("account", "positions", "orders",
+            "quote"); mapped to a connector-specific remote tool name.
+        arguments: Logical arguments for the operation, before the
+            connector-specific wire mapping is applied.
+        interactive_oauth: When False, an expired or missing OAuth grant raises
+            instead of opening a browser on the host. Callers that run without a
+            user in front of them (API handlers, schedulers, portfolio refresh)
+            pass False.
+
+    Returns:
+        The remote tool envelope with profile metadata attached, or an error /
+        ``not_authorized`` envelope when the profile cannot be called.
+    """
     from src.config.loader import load_agent_config
     from src.live.registry import has_cached_oauth_token
     from src.tools.mcp import MCPServerAdapter
@@ -993,8 +1303,15 @@ def _call_remote(profile: TradingProfile, operation: str, arguments: dict[str, A
             ),
         }
 
-    adapter = MCPServerAdapter(server_name, server)
+    # The interactive default is left implicit so the common path keeps the
+    # two-positional-argument construction that adapter substitutes rely on.
+    adapter = (
+        MCPServerAdapter(server_name, server)
+        if interactive_oauth
+        else MCPServerAdapter(server_name, server, interactive_oauth=False)
+    )
     call_result = adapter.call_tool(remote_name, _remote_arguments(profile.connector, operation, arguments))
+    call_result = _normalize_remote_result(profile.connector, operation, call_result)
     account_number = arguments.get("account_number")
     if account_number:
         call_result = dict(call_result)
@@ -1004,6 +1321,10 @@ def _call_remote(profile: TradingProfile, operation: str, arguments: dict[str, A
 
 def _remote_tool_name(connector: str, operation: str) -> str | None:
     """Map generic read operations to current remote MCP tool names."""
+    if connector == "ibkr":
+        from src.trading.connectors.ibkr.mcp import remote_tool_name
+
+        return remote_tool_name(operation)
     if connector == "robinhood":
         from src.trading.connectors.robinhood.mcp import remote_tool_name
 
@@ -1013,11 +1334,26 @@ def _remote_tool_name(connector: str, operation: str) -> str | None:
 
 def _remote_arguments(connector: str, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Normalize generic arguments for a remote MCP operation."""
+    if connector == "ibkr":
+        from src.trading.connectors.ibkr.mcp import remote_arguments
+
+        return remote_arguments(operation, arguments)
     if connector == "robinhood":
         from src.trading.connectors.robinhood.mcp import remote_arguments
 
         return remote_arguments(operation, arguments)
     return {}
+
+
+def _normalize_remote_result(
+    connector: str, operation: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    """Map connector-specific MCP envelopes into shared read payloads."""
+    if connector == "ibkr":
+        from src.trading.connectors.ibkr.mcp import normalize_result
+
+        return normalize_result(operation, result)
+    return result
 
 
 def _unsupported(profile: TradingProfile, capability: str) -> dict[str, Any]:

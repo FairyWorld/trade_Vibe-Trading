@@ -6,7 +6,8 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
-Surfaces 70 tools: skills, research goals, backtest/factor/options/pattern
+Surfaces 74 tools: skills, research goals, strategy discovery,
+backtest/factor/options/pattern
 analysis, market data, fundamentals & capital-flow & news & discovery
 (get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
 get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
@@ -19,7 +20,9 @@ etf_holdings / prediction_market / research_papers), read-only finance math and
 market analytics (quantlib_call / cashflow_performance / orderbook_depth /
 sentiment / technical_indicators / get_fundamentals), read-only
 trading-connector reads, swarm orchestration, trade-journal and shadow-account
-analysis. Every exposed tool is read-only or research-only; no order-placing or
+analysis. Every exposed tool is read-only or research-only except
+refresh_strategy_evidence, which writes ONLY the disposable facade-owned
+strategy-evidence cache from local run artifacts; no order-placing or
 order-cancelling tool is ever surfaced via MCP. The QVeris tools additionally
 require QVeris paid routing (QVERIS_API_KEY + paid mode), and qveris_execute
 is billable research-data execution only — it never places orders.
@@ -76,7 +79,6 @@ from src.market_data import (
     DEFAULT_MAX_ROWS,
     cap_rows,
     detect_source,
-    fetch_market_data_json,
     get_loader,
 )
 
@@ -349,19 +351,29 @@ def _get_goal_store():
 _mcp_session_id: str | None = None
 
 
-def _resolve_session_id(session_id: str = "") -> str:
-    """Resolve the goal session, defaulting to this server process's session.
+def _resolve_session_id(session_id: str = "", ctx: Context | None = None) -> str:
+    """Resolve the goal session: explicit id, then per-connection id, then
+    one id per server process.
 
     The in-process tool registry injects the host session and keeps
     ``session_id`` out of its required schema. MCP has no such injection point,
     so these tools used to mark the id required — asking the model to invent an
     internal identifier it has no way to know, the opposite contract from the
-    local path (#885). Default instead to one stable id per server process,
-    which is the closest MCP equivalent of a host-owned session, while still
-    honouring an explicit id from a client that tracks its own conversations.
+    local path (#885). Default instead to a session id, while still honouring
+    an explicit id from a client that tracks its own conversations.
+
+    A single server process can serve many concurrent MCP connections (the
+    http/sse transports this file documents), so the process-wide fallback on
+    its own would collapse every such caller onto one goal session. ``ctx``,
+    when available, carries FastMCP's own per-connection session id (the real
+    ``mcp-session-id`` header for StreamableHTTP, a cached id for the other
+    transports) and takes precedence over the process fallback for exactly
+    that reason.
 
     Args:
         session_id: Optional client-supplied session id.
+        ctx: Optional MCP request context; supplies a per-connection id when
+            the tool is invoked through a live MCP request.
 
     Returns:
         A non-empty session id.
@@ -369,6 +381,11 @@ def _resolve_session_id(session_id: str = "") -> str:
     global _mcp_session_id
     if cleaned := session_id.strip():
         return cleaned
+    if ctx is not None:
+        try:
+            return ctx.session_id
+        except RuntimeError:
+            pass
     if _mcp_session_id is None:
         import uuid
 
@@ -507,21 +524,26 @@ def list_skills() -> str:
 
 
 @mcp.tool
-def load_skill(name: str) -> str:
-    """Load full documentation for a named finance skill.
+def load_skill(name: str, section: str | None = None, offset: int | None = None) -> str:
+    """Load documentation for a named finance skill.
 
-    Each skill is a comprehensive knowledge document covering methodology,
-    code templates, parameters, and examples. Use list_skills() first to
-    discover available skills.
+    A skill over the tool-result cap is returned as a skeleton (outline plus
+    per-section summaries) instead of being silently cut off. Request a
+    specific section by name, or page through one with offset, to read the
+    rest. Use list_skills() first to discover available skills.
 
     Args:
         name: Skill name (e.g. 'strategy-generate', 'risk-analysis', 'technical-basic').
+        section: Optional section title to expand (see the skeleton's outline).
+        offset: Optional character offset to resume a long section/document from.
     """
-    loader = _get_skills_loader()
-    content = loader.get_content(name)
-    if content.startswith("Error:"):
-        return json.dumps({"status": "error", "error": content}, ensure_ascii=False)
-    return json.dumps({"status": "ok", "skill": name, "content": content}, ensure_ascii=False)
+    registry = _get_registry()
+    params: dict[str, Any] = {"name": name}
+    if section is not None:
+        params["section"] = section
+    if offset is not None:
+        params["offset"] = offset
+    return registry.execute("load_skill", params)
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +562,7 @@ def start_research_goal(
     token_budget: int | None = None,
     turn_budget: int | None = None,
     time_budget_seconds: int | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """Create or replace the current finance research goal for a session.
 
@@ -562,7 +585,7 @@ def start_research_goal(
     try:
         clean_criteria = _clean_list(criteria) or _default_goal_criteria()
         goal = _get_goal_store().replace_goal(
-            session_id=_resolve_session_id(session_id),
+            session_id=_resolve_session_id(session_id, ctx),
             objective=objective,
             criteria=clean_criteria,
             ui_summary=ui_summary,
@@ -580,7 +603,7 @@ def start_research_goal(
 
 
 @mcp.tool
-def get_research_goal(session_id: str = "") -> str:
+def get_research_goal(session_id: str = "", ctx: Context | None = None) -> str:
     """Return the current finance research goal snapshot for a session.
 
     Args:
@@ -588,7 +611,7 @@ def get_research_goal(session_id: str = "") -> str:
             its own sessions; this server then uses one id per process.
     """
     try:
-        snapshot = _get_goal_store().get_current_snapshot(_resolve_session_id(session_id))
+        snapshot = _get_goal_store().get_current_snapshot(_resolve_session_id(session_id, ctx))
     except ValueError as exc:
         return _json_error(str(exc), error_type="validation")
     if snapshot is None:
@@ -621,6 +644,7 @@ def add_goal_evidence(
     confidence: str | None = None,
     caveat: str | None = None,
     contradicts_claim_ids: _lenient_str_list_opt = None,
+    ctx: Context | None = None,
 ) -> str:
     """Append traceable evidence to a finance research goal.
 
@@ -654,7 +678,7 @@ def add_goal_evidence(
         from src.goal import EvidenceInput, StaleGoalError
 
         evidence = _get_goal_store().append_evidence(
-            session_id=_resolve_session_id(session_id),
+            session_id=_resolve_session_id(session_id, ctx),
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             evidence=EvidenceInput(
@@ -700,6 +724,7 @@ def update_research_goal_status(
     session_id: str = "",
     audit: _lenient_dict_list_opt = None,
     recap: str | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """Update a finance research goal status after an audit.
 
@@ -720,7 +745,7 @@ def update_research_goal_status(
         from src.goal import GoalStatus, StaleGoalError
 
         updated = _get_goal_store().update_status(
-            session_id=_resolve_session_id(session_id),
+            session_id=_resolve_session_id(session_id, ctx),
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             status=GoalStatus(status),
@@ -1141,6 +1166,162 @@ def read_file(path: str) -> str:
     """
     registry = _get_registry()
     return registry.execute("read_file", {"path": path})
+
+
+# ---------------------------------------------------------------------------
+# Strategy discovery tools
+# ---------------------------------------------------------------------------
+
+
+def _strategy_discovery_execute(tool_name: str, params: dict[str, Any]) -> str:
+    """Delegate to a strategy-discovery agent tool with an honest error envelope.
+
+    Registry or facade failures never propagate to the MCP client as a bare
+    exception — silent, confident failure is exactly the mode this feature
+    exists to prevent (see the phantom-tool rejection of PR #896). The
+    envelope carries a generic message only; raw exception text can leak
+    internal paths and stays in the server logs via ``logger.exception``.
+    """
+    try:
+        registry = _get_registry()
+        return registry.execute(tool_name, params)
+    except Exception:  # noqa: BLE001 - honest error beats a raw traceback
+        logger.exception("strategy discovery tool %s unavailable", tool_name)
+        return json.dumps(
+            {
+                "status": "error",
+                "error": "strategy discovery unavailable; see server logs",
+            },
+            ensure_ascii=False,
+        )
+
+
+@mcp.tool
+def list_strategies(limit: int = 20, offset: int = 0, source: str | None = None) -> str:
+    """List discoverable strategies across the Alpha Zoo and the SDM strategy store.
+
+    Read-only catalogue of what strategies exist and what state they are in.
+    Rows carry identification metadata plus evidence status; use
+    get_strategy_evidence for the per-regime evidence behind any strategy.
+    Nothing returned is a recommendation — rows below the evidence threshold
+    are flagged insufficient/marginal rather than recommended.
+
+    Args:
+        limit: Maximum number of strategies to return (default 20).
+        offset: Pagination offset for stable browsing (default 0).
+        source: Optional source filter — "alpha_zoo" or "sdm". Omit to
+            browse both sources.
+    """
+    return _strategy_discovery_execute(
+        "list_strategies",
+        {"limit": limit, "offset": offset, "source": source},
+    )
+
+
+@mcp.tool
+def query_strategies(
+    regime: str | None = None,
+    min_sharpe: float | None = None,
+    min_evidence_quality: str = "adequate",
+    min_trades: int = 10,
+    cost_feasible: bool = True,
+    limit: int = 10,
+    include_stale: bool = False,
+) -> str:
+    """Query strategies whose computed per-regime evidence passes the filters.
+
+    Evidence-gated discovery: strategies are ranked by per-regime evidence
+    rows from reproducible backtests instead of boolean scenario tags.
+    Strategies below the evidence thresholds (trade count, coverage) are
+    flagged insufficient/marginal rather than recommended, and the
+    sizing-corrected cost screen keeps only strategies that clear their
+    breakeven.
+
+    Args:
+        regime: Optional market-regime filter — "bear_market",
+            "bull_market", or "structural". Omit to query across all regimes.
+        min_sharpe: Optional minimum Sharpe on the per-regime evidence rows.
+        min_evidence_quality: Minimum evidence quality to keep — "adequate"
+            (default), "marginal", "insufficient", or "any". "any" only
+            removes the quality floor; rows must still pass the other
+            filters (min_trades, cost_feasible, min_sharpe) to be kept.
+        min_trades: Minimum executed-trade count for evidence to count
+            (default 10; fewer trades reads as insufficient evidence).
+        cost_feasible: Keep only strategies that pass the sizing-corrected
+            cost-breakeven screen (default True).
+        limit: Maximum number of strategies to return (default 10).
+        include_stale: Also keep rows whose evidence window is stale (default
+            False). Stale rows fail closed out of default recommendations;
+            True inspects them with their stale-evidence: warnings, sorted
+            after non-stale rows. Relaxes the staleness gate only.
+    """
+    return _strategy_discovery_execute(
+        "query_strategies",
+        {
+            "regime": regime,
+            "min_sharpe": min_sharpe,
+            "min_evidence_quality": min_evidence_quality,
+            "min_trades": min_trades,
+            "cost_feasible": cost_feasible,
+            "limit": limit,
+            "include_stale": include_stale,
+        },
+    )
+
+
+@mcp.tool
+def get_strategy_evidence(strategy_id: str, regime: str | None = None) -> str:
+    """Return the computed per-regime evidence rows for one strategy.
+
+    Read-only evidence detail: shows what reproducible backtests support the
+    strategy in each regime — trade count, coverage, Sharpe, and the
+    sizing-corrected cost breakeven. Rows below the evidence thresholds are
+    flagged insufficient/marginal rather than recommended; the facade refuses
+    regime assessments without computed evidence, so absent regimes are an
+    honest empty, not a guess.
+
+    Args:
+        strategy_id: Strategy identifier from list_strategies or
+            query_strategies.
+        regime: Optional regime filter — "bear_market", "bull_market", or
+            "structural". Omit for every regime with evidence.
+    """
+    return _strategy_discovery_execute(
+        "get_strategy_evidence",
+        {"strategy_id": strategy_id, "regime": regime},
+    )
+
+
+@mcp.tool
+def refresh_strategy_evidence(
+    manifest_path: str | None = None, runs: list | None = None
+) -> str:
+    """Rebuild the strategy-discovery evidence cache from backtest run artifacts.
+
+    WRITE tool with disposable-cache-only scope: it replaces the facade-owned
+    strategy-evidence cache (drop-and-rebuild by contract) from local run
+    artifacts and NEVER touches the Alpha Zoo or SDM sources of truth. No
+    network access, no credentials, no broker paths.
+
+    Provide EXACTLY ONE of the two parameters:
+    - manifest_path: path to a JSON manifest — an object with a "runs" array
+      ({"runs": [{strategy_id, run_dir, position_size?}, ...]}) or a bare
+      JSON array of the same entries.
+    - runs: inline array of {strategy_id, run_dir, position_size?} objects.
+
+    Supplying both or neither returns an error envelope. Runs that fail the
+    ingestion gates (unhealthy artifacts, run_dir outside the allowed run
+    roots) are skipped with machine-readable reasons while the rest still
+    process.
+
+    Args:
+        manifest_path: Path to the JSON manifest file (see above).
+        runs: Inline run specs (see above).
+    """
+    return _strategy_discovery_execute(
+        "refresh_strategy_evidence",
+        {"manifest_path": manifest_path, "runs": runs},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1583,14 +1764,22 @@ def get_market_data(
     of the returned rows ("lots" / "shares"; null = source undeclared) — read
     it before interpreting or comparing volume values across symbols/sources.
     """
-    return fetch_market_data_json(
-        codes=codes,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
-        interval=interval,
-        max_rows=max_rows,
-        loader_resolver=_get_loader,
+    registry = _get_registry()
+    return registry.execute(
+        "get_market_data",
+        {
+            "codes": codes,
+            "start_date": start_date,
+            "end_date": end_date,
+            "source": source,
+            "interval": interval,
+            "max_rows": max_rows,
+            # Internal hook, not an agent-facing parameter: keeps the MCP
+            # surface resolving loaders through mcp_server._get_loader (the
+            # contract the regression tests and the server's own loader
+            # diagnostics rely on) instead of the tool's default resolver.
+            "loader_resolver": _get_loader,
+        },
     )
 
 
@@ -1816,7 +2005,12 @@ def get_sector_info(code: str | None = None, mode: str = "membership", limit: in
 
 
 @mcp.tool
-def get_research_reports(code: str, limit: int = 20) -> str:
+def get_research_reports(
+    code: str,
+    limit: int = 20,
+    beginTime: str | None = None,
+    endTime: str | None = None,
+) -> str:
     """Fetch mainland A-share sell-side research coverage and consensus forecasts.
 
     Returns recent broker research reports (title, brokerage, analyst, publish
@@ -1827,9 +2021,18 @@ def get_research_reports(code: str, limit: int = 20) -> str:
     Args:
         code: A-share symbol in <code>.<exchange> form (SH/SZ/BJ).
         limit: Maximum number of most-recent research reports to return.
+        beginTime: Earliest report publish date (inclusive), 'YYYYMMDD'.
+            Optional; defaults to the start of a trailing two-year window.
+        endTime: Latest report publish date (inclusive), 'YYYYMMDD'.
+            Optional; defaults to today.
     """
+    params: dict[str, Any] = {"code": code, "limit": limit}
+    if beginTime:
+        params["beginTime"] = beginTime
+    if endTime:
+        params["endTime"] = endTime
     registry = _get_registry()
-    return registry.execute("get_research_reports", {"code": code, "limit": limit})
+    return registry.execute("get_research_reports", params)
 
 
 @mcp.tool
@@ -1860,6 +2063,7 @@ def get_sec_filings(
     form: str | None = None,
     metric: str | None = None,
     limit: int = 20,
+    offset: int = 0,
 ) -> str:
     """Fetch U.S. SEC EDGAR filings or reported XBRL financials for a company.
 
@@ -1873,8 +2077,12 @@ def get_sec_filings(
         form: Optional SEC form type filter (e.g. "10-K", "10-Q", "8-K").
         metric: Optional XBRL us-gaap concept name (e.g. "Revenues").
         limit: Maximum number of most-recent filings and metric points to return.
+        offset: Index of the first filing to return, newest first; defaults
+            to 0. Results are returned whole and only as many as fit one
+            response — read paging.total and paging.next_offset and call
+            again with that offset to continue.
     """
-    params: dict[str, Any] = {"ticker": ticker, "limit": limit}
+    params: dict[str, Any] = {"ticker": ticker, "limit": limit, "offset": offset}
     if form:
         params["form"] = form
     if metric:
@@ -1884,7 +2092,7 @@ def get_sec_filings(
 
 
 @mcp.tool
-def get_financial_statements(code: str, statement: str = "indicators", period: str = "annual") -> str:
+def get_financial_statements(code: str, statement: str = "indicators", period: str = "annual", offset: int = 0) -> str:
     """Fetch a stock's financial statements or key per-period indicators.
 
     Markets: A-share (.SH/.SZ/.BJ, via Sina), US (.US) and Hong Kong (.HK, via
@@ -1895,11 +2103,15 @@ def get_financial_statements(code: str, statement: str = "indicators", period: s
         code: Single symbol with a market suffix (e.g. "600519.SH", "AAPL.US").
         statement: "balance", "income", "cashflow", or "indicators".
         period: "annual" or "quarter".
+        offset: Index of the first period to return, newest first; defaults
+            to 0. Periods are returned whole and only as many as fit one
+            response — read paging.total and paging.next_offset and call
+            again with that offset to continue.
     """
     registry = _get_registry()
     return registry.execute(
         "get_financial_statements",
-        {"code": code, "statement": statement, "period": period},
+        {"code": code, "statement": statement, "period": period, "offset": offset},
     )
 
 
@@ -2347,6 +2559,11 @@ def _run_to_dict(run, *, timed_out: bool = False, is_stale: bool = False) -> dic
     threshold. No disk state is changed by setting this — the explicit
     :func:`reap_stale_runs` tool is what finalizes a stale run.
     """
+    from src.swarm.models import (
+        public_model_metadata,
+        public_provider_metadata,
+        public_reasoning_effort,
+    )
     from src.swarm.serialization import run_level_error, serialize_task
 
     return {
@@ -2360,6 +2577,10 @@ def _run_to_dict(run, *, timed_out: bool = False, is_stale: bool = False) -> dic
         "final_report": run.final_report,
         "total_input_tokens": run.total_input_tokens,
         "total_output_tokens": run.total_output_tokens,
+        "provider": public_provider_metadata(run.provider),
+        "model": public_model_metadata(run.model),
+        "reasoning_effort": public_reasoning_effort(run.reasoning_effort),
+        "use_responses_api": run.use_responses_api,
         "timed_out": timed_out,
         "is_stale": is_stale,
     }
@@ -2446,6 +2667,12 @@ def list_runs(limit: int = 20) -> str:
     Args:
         limit: Maximum number of runs to return (default 20).
     """
+    from src.swarm.models import (
+        public_model_metadata,
+        public_provider_metadata,
+        public_reasoning_effort,
+    )
+
     store = _get_swarm_store()
     runs = store.list_runs(limit=limit)
     items = []
@@ -2468,6 +2695,10 @@ def list_runs(limit: int = 20) -> str:
                 "task_counts": counts,
                 "total_input_tokens": reconciled.total_input_tokens,
                 "total_output_tokens": reconciled.total_output_tokens,
+                "provider": public_provider_metadata(reconciled.provider),
+                "model": public_model_metadata(reconciled.model),
+                "reasoning_effort": public_reasoning_effort(reconciled.reasoning_effort),
+                "use_responses_api": reconciled.use_responses_api,
             }
         )
     return json.dumps(items, ensure_ascii=False, indent=2)
@@ -2491,7 +2722,7 @@ def reap_stale_runs() -> str:
 
 
 @mcp.tool
-def retry_run(run_id: str) -> str:
+def retry_run(run_id: str, resume: bool = False) -> str:
     """Retry a failed, stale, or cancelled swarm run.
 
     Re-launches a brand-new run with the same preset and variables as the
@@ -2499,8 +2730,17 @@ def retry_run(run_id: str) -> str:
     spotting a ``failed`` or stale run via ``list_runs``. A still-``running``
     run cannot be retried — cancel or reap it first.
 
+    With ``resume=True`` (replay), completed upstream tasks and their artifacts
+    are carried into the new run as-is and only the failed/cancelled subgraph
+    re-executes — completed independent branches are not re-run. ``resume``
+    only applies to a ``failed`` or ``cancelled`` run; ``resume=True`` for any
+    other status is refused with an error (a plain retry without ``resume``
+    remains available for any non-running run).
+
     Args:
         run_id: ID of the run to retry (from ``list_runs`` / ``get_swarm_status``).
+        resume: Replay the failed/cancelled subgraph instead of re-running the
+            whole preset. Default ``False`` preserves the existing full re-run.
 
     Returns:
         JSON payload for the newly created run (``run_id`` / ``status`` /
@@ -2526,6 +2766,17 @@ def retry_run(run_id: str) -> str:
             {"status": "error", "error": "Cannot retry a running run. Cancel or reap it first."},
             ensure_ascii=False,
         )
+    if resume and reconciled.status not in (RunStatus.failed, RunStatus.cancelled):
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    f"Cannot resume a run in status '{reconciled.status.value}'; "
+                    "resume only applies to failed or cancelled runs."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     agent_config = load_swarm_agent_config()
     runtime = SwarmRuntime(store=store, agent_config=agent_config)
@@ -2534,6 +2785,7 @@ def retry_run(run_id: str) -> str:
             reconciled.preset_name,
             reconciled.user_vars or {},
             include_shell_tools=_include_shell_tools,
+            resume_from=reconciled if resume else None,
         )
     except FileNotFoundError as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)

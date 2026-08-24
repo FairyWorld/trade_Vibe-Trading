@@ -27,6 +27,7 @@ from src.quantlib.valuation.comps import (
     FlowMetricPeriods,
     PeerCompany,
     TargetCompany,
+    _compute_multiple,
     calendarise_metric,
     enterprise_value,
     equity_value_from_enterprise_value,
@@ -776,3 +777,75 @@ def test_full_hand_computed_example():
     # No small-sample warning: 4 peers >= MIN_ROBUST_COMPS, and CCC's single
     # exclusion still leaves 3 included for ev_ebitda.
     assert result.warnings == ()
+
+
+def test_non_finite_numerator_is_excluded_not_a_nan_multiple():
+    value, excluded = _compute_multiple(
+        float("nan"), 100.0, peer_name="NANCO", multiple_name="ev_ebitda"
+    )
+    assert value is None
+    assert excluded is not None
+    assert excluded.peer_name == "NANCO"
+    assert excluded.reason == "non_finite_numerator"
+
+
+def test_non_finite_denominator_is_excluded_not_a_nan_multiple():
+    value, excluded = _compute_multiple(
+        200.0, float("inf"), peer_name="INFCO", multiple_name="ev_ebitda"
+    )
+    assert value is None
+    assert excluded is not None
+    assert excluded.reason == "non_finite_denominator"
+
+
+def test_finite_positive_multiple_is_still_computed():
+    value, excluded = _compute_multiple(200.0, 10.0, peer_name="OK", multiple_name="ev_ebitda")
+    assert excluded is None
+    assert value == pytest.approx(20.0, abs=EXACT)
+
+
+def test_enterprise_value_refuses_non_finite_inputs():
+    with pytest.raises(ValuationError):
+        enterprise_value(market_cap=float("nan"), total_debt=100.0, cash_and_equivalents=20.0)
+    with pytest.raises(ValuationError):
+        enterprise_value(market_cap=200.0, total_debt=float("inf"), cash_and_equivalents=20.0)
+    with pytest.raises(ValuationError):
+        enterprise_value(market_cap=200.0, total_debt=100.0, cash_and_equivalents=float("nan"))
+
+
+def test_equity_value_from_enterprise_value_refuses_non_finite_enterprise_value():
+    with pytest.raises(ValuationError):
+        equity_value_from_enterprise_value(
+            enterprise_value=float("inf"), total_debt=100.0, cash_and_equivalents=20.0
+        )
+
+
+def test_enterprise_value_finite_bridge_is_unchanged():
+    result = enterprise_value(market_cap=200.0, total_debt=100.0, cash_and_equivalents=20.0)
+    assert result.enterprise_value == pytest.approx(280.0, abs=EXACT)
+
+
+def test_calendarise_metric_refuses_non_finite_period_values():
+    with pytest.raises(ValuationError):
+        calendarise_metric(
+            _flow(float("nan"), ytd=10.0, prior_ytd=5.0),
+            "ltm", metric_name="ebitda", company_name="X",
+        )
+    with pytest.raises(ValuationError):
+        calendarise_metric(
+            _flow(100.0, ytd=float("inf"), prior_ytd=5.0),
+            "ltm", metric_name="ebitda", company_name="X",
+        )
+    with pytest.raises(ValuationError):
+        calendarise_metric(
+            _flow(100.0, next_fy=float("nan"), month=6),
+            "calendar_year", metric_name="revenue", company_name="X",
+        )
+
+
+def test_calendarise_metric_finite_ltm_is_unchanged():
+    result = calendarise_metric(
+        _flow(100.0, ytd=40.0, prior_ytd=30.0),
+        "ltm", metric_name="ebitda", company_name="X",
+    )
+    assert result.value == pytest.approx(110.0, abs=EXACT)

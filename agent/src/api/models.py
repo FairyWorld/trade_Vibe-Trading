@@ -68,6 +68,7 @@ class RunResponse(BaseModel):
 
     metrics: Optional[BacktestMetrics] = Field(None, description="Backtest metrics")
     artifacts: List[Artifact] = Field(default_factory=list, description="Run artifacts")
+    has_factor_artifacts: bool = Field(False, description="Whether the run produced factor-analysis artifacts")
     run_card: Optional[Dict[str, Any]] = Field(None, description="Trust Layer run card payload")
     llm_usage: Optional[Dict[str, Any]] = Field(None, description="Provider-reported AgentLoop usage summary")
 

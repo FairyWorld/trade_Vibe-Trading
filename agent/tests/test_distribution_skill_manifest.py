@@ -119,3 +119,29 @@ def test_mcp_tool_heading_matches_registered_tools() -> None:
     manifest and no test could see it. Ask the server.
     """
     _assert_all_counts(r"Available MCP Tools\s*\((\d+)\)", _live_mcp_tool_count())
+
+
+def test_manifest_python_requirement_matches_pyproject() -> None:
+    """The manifest's declared Python range must be the packaged one.
+
+    ``SKILL.md`` is a distribution manifest: consumers read the ``python:``
+    field to decide whether the package is installable. Nothing else compared
+    it against ``pyproject.toml``, so when the ``<3.14`` upper bound was
+    dropped from packaging the manifest silently kept advertising it.
+    """
+    import tomllib
+
+    pyproject = tomllib.loads(
+        (AGENT_ROOT.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    packaged = pyproject["project"]["requires-python"].replace(" ", "")
+    declared = re.search(
+        r'^\s*python:\s*"([^"]+)"', MANIFEST_PATH.read_text(encoding="utf-8"), re.M
+    )
+    assert declared is not None, "SKILL.md declares no python requirement"
+    assert set(declared.group(1).replace(" ", "").split(",")) == set(
+        packaged.split(",")
+    ), (
+        f"SKILL.md says python {declared.group(1)!r} but pyproject.toml "
+        f"requires {packaged!r}"
+    )

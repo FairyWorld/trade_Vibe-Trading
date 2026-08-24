@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
@@ -6,12 +7,14 @@ import { fileURLToPath } from "node:url";
 
 import { BackendManager } from "../dist/backend-manager.js";
 import { getDesktopMessages } from "../dist/locales.js";
+import { startUnrelatedPythonSentinel } from "./process-sentinel.mjs";
 
 const electronRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const logDirectory = await mkdtemp(path.join(os.tmpdir(), "vibe-trading-desktop-shell-"));
 const statuses = [];
 let unexpectedExit;
 const apiAuthKey = randomBytes(32).toString("base64url");
+const unrelatedPython = await startUnrelatedPythonSentinel();
 
 const backend = new BackendManager({
   appPath: electronRoot,
@@ -26,6 +29,7 @@ const backend = new BackendManager({
 });
 
 let url;
+let shutdownEvidence;
 try {
   url = await backend.start();
   const parsed = new URL(url);
@@ -48,23 +52,23 @@ try {
   }
   if (unexpectedExit) throw new Error(unexpectedExit);
 } finally {
-  await backend.stop();
-}
-
-let stopped = false;
-if (url) {
   try {
-    await fetch(new URL("health", url), { signal: AbortSignal.timeout(1_000) });
-  } catch {
-    stopped = true;
+    shutdownEvidence = await backend.stopForUpdate();
+    assert.equal(unrelatedPython.isAlive(), true, "Shutdown terminated an unrelated Python process");
+  } finally {
+    await unrelatedPython.stop();
   }
 }
-if (!stopped) throw new Error("Backend still accepted connections after shutdown");
+assert.equal(shutdownEvidence.backendExited, true);
+assert.equal(shutdownEvidence.watchdogExited, true);
+assert.equal(shutdownEvidence.listenerClosed, true);
 
 console.log(JSON.stringify({
   backendOrigin: new URL(url).origin,
   statuses,
   logDirectory,
   authBoundaryVerified: true,
-  shutdownVerified: stopped,
+  shutdownVerified: true,
+  unrelatedPythonPid: unrelatedPython.pid,
+  unrelatedPythonSurvived: true,
 }, null, 2));

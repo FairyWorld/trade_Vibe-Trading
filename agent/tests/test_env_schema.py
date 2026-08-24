@@ -78,9 +78,30 @@ class TestEnvConfigDefaults:
         assert c.llm.vibe_trading_disable_http_proxy is False
         assert c.llm.max_retries == 2
         assert c.llm.langchain_reasoning_effort == ""
+        assert c.llm.langchain_use_responses_api is None
         assert c.llm.vibe_trading_deepseek_adapter == "auto"
         assert c.llm.moonshot_user_agent == ""
         assert c.llm.openai_codex_base_url == "https://chatgpt.com/backend-api/codex/responses"
+
+    def test_llm_responses_api_reads_boolean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "true")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is True
+
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "false")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
+
+    @pytest.mark.parametrize("value", ["TRUE", "yes", "1", "on"])
+    def test_llm_responses_api_requires_literal_true(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", value)
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
 
     def test_data_defaults(self) -> None:
         c = EnvConfig()

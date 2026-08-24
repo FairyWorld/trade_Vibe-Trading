@@ -20,14 +20,20 @@ from src.quantlib.credit import (
     ZONE_LABELS_ZH,
     AltmanZScore,
     altman_z_score,
+    cds_price,
     credit_spread_analysis,
+    credit_spread_dv01,
     distance_to_default,
     edf_reference_band,
+    hazard_rate_to_survival_probability,
+    expected_loss,
     kmv_default_point,
     kmv_distance_to_default,
     merton_asset_solve,
     merton_model,
     spread_term_structure,
+    survival_probability_to_hazard_rate,
+    vasicek_credit_var,
 )
 
 # One balance sheet, reused so the three variants can be compared like for like.
@@ -496,3 +502,112 @@ def test_spread_term_structure_validates_its_inputs():
         spread_term_structure({}, {1: 0.02})
     with pytest.raises(ValueError, match="unknown input_unit"):
         spread_term_structure({"x": {1: 0.025}}, {1: 0.02}, input_unit="ratio")
+
+
+# --------------------------------------------------------------------------
+# CDS Pricing & Hazard Rate Tests
+# --------------------------------------------------------------------------
+
+
+def test_hazard_rate_and_survival_prob_roundtrip():
+    lambda_val = 0.025
+    T = 5.0
+    q = hazard_rate_to_survival_probability(lambda_val, T)
+    assert 0.0 < q < 1.0
+    recovered_lambda = survival_probability_to_hazard_rate(q, T)
+    assert recovered_lambda == pytest.approx(lambda_val, rel=1e-12)
+
+
+def test_cds_price_fair_par_spread_zero_upfront():
+    # When the fixed running coupon equals the model par spread, upfront payment is identically 0.
+    spread = 150.0
+    res_par = cds_price(
+        spread_bps=spread,
+        coupon_bps=spread,
+        recovery_rate=0.40,
+        tenor_years=5.0,
+        risk_free_rate=0.03,
+    )
+    par_bps = res_par["par_spread_bps"]
+    result = cds_price(
+        spread_bps=spread,
+        coupon_bps=par_bps,
+        recovery_rate=0.40,
+        tenor_years=5.0,
+        risk_free_rate=0.03,
+    )
+    assert result["upfront_pct"] == pytest.approx(0.0, abs=1e-12)
+    assert result["upfront_amount"] == pytest.approx(0.0, abs=1e-6)
+    assert result["par_spread_bps"] == pytest.approx(spread, rel=0.05)
+    assert result["survival_probability"] == pytest.approx(np.exp(-result["hazard_rate"] * 5.0), rel=1e-12)
+    assert result["default_probability"] == pytest.approx(1.0 - result["survival_probability"], rel=1e-12)
+
+def test_cds_price_buyer_mtm_positive_when_spread_above_coupon():
+    # Quoted spread 250 bps > 100 bps running coupon -> protection buyer has positive MTM
+    result = cds_price(
+        spread_bps=250.0,
+        coupon_bps=100.0,
+        recovery_rate=0.40,
+        tenor_years=5.0,
+        notional=10_000_000.0,
+    )
+    assert result["upfront_amount"] > 0.0
+    assert result["buyer_mtm"] > 0.0
+    assert result["protection_leg_pv"] > result["premium_leg_pv"]
+
+
+def test_cds_price_input_validation():
+    with pytest.raises(ValueError, match="spread_bps must be non-negative"):
+        cds_price(spread_bps=-10.0)
+    with pytest.raises(ValueError, match="recovery_rate"):
+        cds_price(spread_bps=100.0, recovery_rate=1.0)
+    with pytest.raises(ValueError, match="tenor_years"):
+        cds_price(spread_bps=100.0, tenor_years=0.0)
+    with pytest.raises(ValueError, match="notional"):
+        cds_price(spread_bps=100.0, notional=-1000.0)
+    with pytest.raises(ValueError, match="hazard_rate"):
+        hazard_rate_to_survival_probability(-0.01, 5.0)
+    with pytest.raises(ValueError, match="survival_prob"):
+        survival_probability_to_hazard_rate(1.5, 5.0)
+# Vasicek Credit Risk & Expected Loss Tests
+# --------------------------------------------------------------------------
+
+
+def test_expected_loss_exact_multiplication():
+    # EAD = $10,000,000, PD = 2%, LGD = 45% -> EL = 10,000,000 * 0.02 * 0.45 = $90,000
+    assert expected_loss(10_000_000.0, 0.02, 0.45) == pytest.approx(90_000.0)
+
+
+def test_vasicek_credit_var_monotonic_with_correlation():
+    ead = 1_000_000.0
+    pd_val = 0.01
+    lgd = 0.40
+
+    res_low_rho = vasicek_credit_var(ead, pd_val, lgd, asset_correlation=0.10, confidence=0.999)
+    res_high_rho = vasicek_credit_var(ead, pd_val, lgd, asset_correlation=0.30, confidence=0.999)
+
+    assert res_low_rho["expected_loss"] == pytest.approx(res_high_rho["expected_loss"])
+    # Higher correlation leads to higher tail risk (WCDR and unexpected loss)
+    assert res_high_rho["wcdr"] > res_low_rho["wcdr"]
+    assert res_high_rho["unexpected_loss"] > res_low_rho["unexpected_loss"]
+    assert res_high_rho["capital_ratio"] > res_low_rho["capital_ratio"]
+
+
+def test_credit_spread_dv01_exact():
+    # 5.0 year spread duration on $1,000,000 par at par price 100:
+    # CS01 = 5.0 * (100/100) * 1e-4 * 1,000,000 = $500
+    cs01 = credit_spread_dv01(spread_duration=5.0, price=100.0, face=100.0, par_amount=1_000_000.0)
+    assert cs01 == pytest.approx(500.0)
+
+
+def test_vasicek_input_validation():
+    with pytest.raises(ValueError, match="ead must be strictly positive"):
+        vasicek_credit_var(-100.0, 0.01, 0.4, 0.1)
+    with pytest.raises(ValueError, match="pd must be in"):
+        vasicek_credit_var(1000.0, 1.5, 0.4, 0.1)
+    with pytest.raises(ValueError, match="asset_correlation"):
+        vasicek_credit_var(1000.0, 0.01, 0.4, 1.0)
+    with pytest.raises(ValueError, match="confidence"):
+        vasicek_credit_var(1000.0, 0.01, 0.4, 0.1, confidence=1.5)
+    with pytest.raises(ValueError, match="spread_duration non-negative"):
+        credit_spread_dv01(spread_duration=-1.0)

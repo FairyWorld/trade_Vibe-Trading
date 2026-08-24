@@ -223,6 +223,37 @@ class _LocalAliasLoader:
         return {clean: pd.DataFrame({"close": [1.0]}, index=idx)}
 
 
+class _TorontoOnlyLoader:
+    """Serves only ``.TO`` symbols — mimics Yahoo after a listing moved
+    TSX Venture -> TSX main (HIVE.V 404s, HIVE.TO resolves)."""
+
+    def fetch(self, codes, start_date, end_date, interval="1D"):
+        idx = pd.to_datetime(["2026-01-01", "2026-01-02"])
+        idx.name = "trade_date"
+        out = {}
+        for code in codes:
+            if code.upper().endswith(".TO"):
+                out[code] = pd.DataFrame(
+                    {"close": [4.24, 4.30], "volume": [100, 200]}, index=idx
+                )
+        return out
+
+
+class _VentureOnlyLoader:
+    """Serves only ``.V`` symbols — the reverse (TSX -> TSX Venture move)."""
+
+    def fetch(self, codes, start_date, end_date, interval="1D"):
+        idx = pd.to_datetime(["2026-01-01", "2026-01-02"])
+        idx.name = "trade_date"
+        out = {}
+        for code in codes:
+            if code.upper().endswith(".V"):
+                out[code] = pd.DataFrame(
+                    {"close": [0.55, 0.60], "volume": [300, 400]}, index=idx
+                )
+        return out
+
+
 def test_fetch_explicit_source_normalizes_rows() -> None:
     out = fetch_market_data(
         codes=["AAPL.US"],
@@ -395,6 +426,112 @@ def test_fetch_local_result_alias_is_not_unresolved() -> None:
 
     assert "AAPL.US" in out
     assert "_unresolved" not in out
+
+
+# --------------------------------------------------------------------------
+# Canadian venue-alias fallback (.V <-> .TO) — moved listings resolve via the
+# sibling venue's symbol instead of landing in _unresolved.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_canadian_v_falls_back_to_to_sibling() -> None:
+    """HIVE.V 404s (listing moved to TSX) -> HIVE.TO served under HIVE.V."""
+    out = fetch_market_data(
+        codes=["HIVE.V"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=lambda src: _TorontoOnlyLoader,
+        include_provenance=True,
+    )
+    assert "_unresolved" not in out
+    assert "HIVE.V" in out
+    assert out["HIVE.V"][0]["close"] == 4.24
+    prov = out["_provenance"]["HIVE.V"]
+    assert prov["venue_fallback"] is True
+    assert prov["resolved_symbol"] == "HIVE.TO"
+
+
+def test_fetch_canadian_to_falls_back_to_v_sibling() -> None:
+    """Reverse direction: a .TO symbol whose only live venue is .V."""
+    out = fetch_market_data(
+        codes=["HIVE.TO"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=lambda src: _VentureOnlyLoader,
+        include_provenance=True,
+    )
+    assert "_unresolved" not in out
+    assert "HIVE.TO" in out
+    assert out["HIVE.TO"][0]["close"] == 0.55
+    prov = out["_provenance"]["HIVE.TO"]
+    assert prov["venue_fallback"] is True
+    assert prov["resolved_symbol"] == "HIVE.V"
+
+
+def test_fetch_canadian_aliases_sibling_already_resolved() -> None:
+    """When both venues are requested and only the sibling resolves, the
+    missing one is aliased to the resolved sibling's bars with no extra fetch."""
+    calls: list[list[str]] = []
+
+    class _RecordingTorontoLoader:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            calls.append(list(codes))
+            idx = pd.to_datetime(["2026-01-01", "2026-01-02"])
+            idx.name = "trade_date"
+            return {
+                code: pd.DataFrame(
+                    {"close": [4.24, 4.30], "volume": [100, 200]}, index=idx
+                )
+                for code in codes
+                if code.upper().endswith(".TO")
+            }
+
+    out = fetch_market_data(
+        codes=["HIVE.V", "HIVE.TO"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=lambda src: _RecordingTorontoLoader,
+        include_provenance=True,
+    )
+    assert "_unresolved" not in out
+    assert "HIVE.V" in out and "HIVE.TO" in out
+    assert out["HIVE.V"] == out["HIVE.TO"]  # aliased — identical bars
+    # The .V symbol must be aliased from the already-resolved .TO sibling:
+    # exactly one group fetch (both codes together), no separate re-fetch of
+    # the sibling after the fact.
+    assert len(calls) == 1
+    assert set(calls[0]) == {"HIVE.V", "HIVE.TO"}
+    assert out["_provenance"]["HIVE.V"]["resolved_symbol"] == "HIVE.TO"
+    assert out["_provenance"]["HIVE.V"]["venue_fallback"] is True
+
+
+def test_fetch_non_canadian_symbol_unaffected_by_venue_fallback() -> None:
+    """A non-Canadian symbol that fails must stay _unresolved — the sibling
+    fallback only ever fires for .TO/.V symbols."""
+    out = fetch_market_data(
+        codes=["AAPL.US"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=lambda src: _TorontoOnlyLoader,
+    )
+    assert out["_unresolved"] == ["AAPL.US"]
+
+
+def test_ca_venue_sibling_swaps_suffix_only() -> None:
+    """Unit check for the sibling helper, incl. hyphenated class bases."""
+    from src.market_data import _ca_venue_sibling
+
+    assert _ca_venue_sibling("HIVE.V") == "HIVE.TO"
+    assert _ca_venue_sibling("HIVE.TO") == "HIVE.V"
+    assert _ca_venue_sibling("BBD-B.TO") == "BBD-B.V"
+    assert _ca_venue_sibling("PNG.V") == "PNG.TO"
+    assert _ca_venue_sibling("AAPL.US") is None
+    assert _ca_venue_sibling("local:HIVE.V") is None
+    assert _ca_venue_sibling("BTC-USDT") is None
 
 
 # --------------------------------------------------------------------------

@@ -75,6 +75,7 @@ data/overnight*.log
 data/*.log
 data/test_write.txt
 agent/.pytest_tmp/
+agent/.pytest-tmp/
 agent/vibe_trading.egg-info/
 agent/vibe_trading_ai.egg-info/
 agent/tests/e2e_backtest/
@@ -113,3 +114,7 @@ desktop/electron/runtime/
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
 bench_report.json
+
+# Grounding ledger persisted by ad-hoc verification scripts into tests/
+agent/tests/artifacts/
+.idea/*

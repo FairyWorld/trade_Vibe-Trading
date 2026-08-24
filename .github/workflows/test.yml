@@ -11,26 +11,65 @@ on:
   workflow_dispatch:
 
 jobs:
+  hash-lock:
+    name: Hash lock / ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-24.04
+            architecture: x64
+          - name: macOS ARM64
+            runner: macos-15
+            architecture: arm64
+          - name: Windows x64
+            runner: windows-2025
+            architecture: x64
+
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # actions/setup-python v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.architecture }}
+          cache: pip
+
+      - name: Verify hash-locked dependencies
+        # Both locks, separately: each must be internally complete on its own,
+        # because the Docker build installs them as two independent
+        # --require-hashes passes. A native matrix is required because package
+        # markers are evaluated for the host running pip.
+        run: |
+          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
+          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
+
   test:
+    name: test / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling of `requires-python` in pyproject.toml.
+        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
+        # supporting a version nothing exercises is how the cap got stale in
+        # the first place. Raise the upper leg whenever the floor or a new
+        # CPython release moves.
+        python-version: ["3.11", "3.14"]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. Verifying only the main lock would let the
-        # channel lock rot until a release build failed.
-        run: |
-          pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
 
       - name: Install dependencies
         # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
@@ -154,6 +193,10 @@ jobs:
       - name: Install desktop dependencies
         working-directory: desktop/electron
         run: npm ci
+
+      - name: Prepare verified Electron runtime
+        working-directory: desktop/electron
+        run: npm run prepare:electron
 
       - name: Build desktop shell
         working-directory: desktop/electron

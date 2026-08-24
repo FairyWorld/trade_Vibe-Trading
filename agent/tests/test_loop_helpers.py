@@ -18,6 +18,9 @@ from src.agent.loop import (
     _is_tool_success,
     _normalize_tool_run_dir,
     _archive_backtest_result,
+    _llm_timeout_seconds,
+    _stall_timeout_seconds,
+    _verification_ledger,
 )
 
 
@@ -356,6 +359,86 @@ class TestArchiveBacktestResult:
         assert (active / "code" / "signal_engine.py").is_file()
         assert (active / "config.json").is_file()
 
+    def test_two_backtests_in_one_turn_do_not_mix_artifacts(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The active run must describe ONE backtest, not the union of two (#1094).
+
+        The archive used to be a plain merge, so a file only the first backtest
+        produced survived next to the second one's output, and ``/runs/{id}``
+        listed it as an artifact of the current run.
+        """
+        monkeypatch.setenv("VIBE_TRADING_ALLOWED_RUN_ROOTS", str(tmp_path))
+        active = tmp_path / "active"
+        (active / "code").mkdir(parents=True)
+        # Written by the agent into the ACTIVE run before backtest is called;
+        # it is the reason a blanket wipe of the target is not the fix.
+        (active / "code" / "signal_engine.py").write_text("own\n", encoding="utf-8")
+
+        def _backtest(name: str, extra: str | None) -> Path:
+            source = tmp_path / name
+            (source / "artifacts").mkdir(parents=True)
+            (source / "artifacts" / "metrics.csv").write_text(
+                f"total_return\n{name}\n", encoding="utf-8"
+            )
+            if extra:
+                (source / "artifacts" / extra).write_text("stale\n", encoding="utf-8")
+            return source
+
+        first = _backtest("run-a", "extra.csv")
+        assert _archive_backtest_result(
+            json.dumps({"status": "ok", "run_dir": str(first)}), str(active)
+        )
+        assert (active / "artifacts" / "extra.csv").is_file()
+
+        second = _backtest("run-b", None)
+        assert _archive_backtest_result(
+            json.dumps({"status": "ok", "run_dir": str(second)}), str(active)
+        )
+
+        # run-a's file is gone; run-b's output is what the run reports.
+        assert not (active / "artifacts" / "extra.csv").exists()
+        assert (active / "artifacts" / "metrics.csv").read_text(
+            encoding="utf-8"
+        ) == "total_return\nrun-b\n"
+        # The active run's own code survives — only prior ARCHIVE output is dropped.
+        assert (active / "code" / "signal_engine.py").read_text(encoding="utf-8") == "own\n"
+        # Provenance records which backtest the artifacts describe.
+        manifest = json.loads(
+            (active / ".archived_backtest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["source_run"] == "run-b"
+        assert "artifacts/metrics.csv" in manifest["files"]
+
+    def test_manifest_cannot_delete_outside_the_active_run(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A manifest is read back off disk, so its names must stay contained.
+
+        Without the containment check the delete step is an arbitrary-file-unlink
+        primitive driven by a file inside a run directory.
+        """
+        monkeypatch.setenv("VIBE_TRADING_ALLOWED_RUN_ROOTS", str(tmp_path))
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep me\n", encoding="utf-8")
+        active = tmp_path / "active"
+        active.mkdir()
+        (active / ".archived_backtest.json").write_text(
+            json.dumps({"source_run": "spoofed", "files": ["../victim.txt"]}),
+            encoding="utf-8",
+        )
+        source = tmp_path / "detached"
+        (source / "artifacts").mkdir(parents=True)
+        (source / "artifacts" / "metrics.csv").write_text(
+            "total_return\n0.1\n", encoding="utf-8"
+        )
+
+        assert _archive_backtest_result(
+            json.dumps({"status": "ok", "run_dir": str(source)}), str(active)
+        )
+
+        assert victim.read_text(encoding="utf-8") == "keep me\n"
+
     def test_ignores_result_without_metrics(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("VIBE_TRADING_ALLOWED_RUN_ROOTS", str(tmp_path))
         source = tmp_path / "not-a-backtest"
@@ -392,3 +475,126 @@ class TestArchiveBacktestResult:
 
         assert archived is False
         assert not (active / "artifacts").exists()
+
+
+def test_llm_timeout_seconds_default_and_override(monkeypatch) -> None:
+    """The LLM call timeout reads config and honors a module-level override."""
+    import src.agent.loop as loop_module
+
+    assert _llm_timeout_seconds() > 0
+    monkeypatch.setattr(loop_module, "LLM_TIMEOUT_SECONDS", 42.0, raising=False)
+    assert _llm_timeout_seconds() == 42.0
+    monkeypatch.delattr(loop_module, "LLM_TIMEOUT_SECONDS", raising=False)
+    assert _llm_timeout_seconds() > 0
+
+def test_pending_write_directive_tracks_written_targets(tmp_path: Path) -> None:
+    """A named target file that was not written yields a write directive.
+
+    Regression for runs that ended "success" without delivering a file
+    (2026-08-15 mutual-fund update): the loop must remind the model to write
+    the task target before the forced-text final iteration. The directive
+    clears once the file is written directly (write_file/edit_file) or by
+    any process with a newer mtime (the bash workaround), and only fires for
+    messages with create/update intent.
+    """
+    import os
+    import time
+
+    import src.agent.loop as loop_module
+    from src.agent.loop import AgentLoop
+    from src.agent.tools import ToolRegistry
+
+    agent = AgentLoop(registry=ToolRegistry(), llm=None)
+    now = time.time()
+    target = str(tmp_path / "plan.md")
+    msg = f"please update {target}"
+
+    assert loop_module._TARGET_ACTION_RE.search(msg)
+    assert not loop_module._TARGET_ACTION_RE.search("what is the weather?")
+
+    unwritten = agent._pending_write_directive(msg, now)
+    assert "NOT been written" in unwritten and "plan.md" in unwritten
+
+    agent._record_written_target({"path": target})
+    assert agent._pending_write_directive(msg, now) == ""
+
+    # A bash-style write (mtime newer than run start) also counts.
+    agent2 = AgentLoop(registry=ToolRegistry(), llm=None)
+    p = tmp_path / "bash_plan.md"
+    p.write_text("x", encoding="utf-8")
+    os.utime(p, (now, now))
+    assert agent2._pending_write_directive(
+        f"please update {p}", now - 10,
+    ) == ""
+    # An old file not written this run still fires.
+    old = tmp_path / "old_plan.md"
+    old.write_text("x", encoding="utf-8")
+    os.utime(old, (now - 100, now - 100))
+    assert "old_plan.md" in agent2._pending_write_directive(
+        f"please update {old}", now - 10,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _verification_ledger
+# ---------------------------------------------------------------------------
+
+
+def test_verification_ledger_extracts_calc_results() -> None:
+    """A successful financial_rigor calc result becomes a terse ledger line."""
+    messages = [
+        {"role": "tool", "name": "financial_rigor", "content": json.dumps({
+            "status": "ok", "command": "calc",
+            "expr": "92.13/101.65-1", "result": -0.0937, "result_exact": "-0.09365912",
+        })},
+        {"role": "tool", "name": "financial_rigor", "content": json.dumps({
+            "status": "ok", "command": "calc",
+            "expr": "85.4/108.8-1", "result": -0.2151, "result_exact": "-0.21507353",
+        })},
+    ]
+    from src.agent.loop import _verification_ledger
+    ledger = _verification_ledger(messages)
+    assert "calc 92.13/101.65-1 = -0.09365912" in ledger
+    assert "calc 85.4/108.8-1 = -0.21507353" in ledger
+
+
+def test_verification_ledger_skips_errors_and_other_tools() -> None:
+    """Failed results, non-financial_rigor tools, and non-JSON are skipped."""
+    messages = [
+        {"role": "tool", "name": "financial_rigor", "content": json.dumps({
+            "status": "error", "command": "calc", "error": "malformed",
+        })},
+        {"role": "tool", "name": "get_market_data", "content": json.dumps({"status": "ok"})},
+        {"role": "tool", "name": "financial_rigor", "content": "not json at all"},
+        {"role": "user", "content": "hello"},
+    ]
+    from src.agent.loop import _verification_ledger
+    assert _verification_ledger(messages) == ""
+
+
+def test_verification_ledger_deduplicates_and_caps() -> None:
+    """Duplicate ledger lines collapse; the ledger is capped."""
+    messages = [
+        {"role": "tool", "name": "financial_rigor", "content": json.dumps({
+            "status": "ok", "command": "calc",
+            "expr": "a/b", "result": 1.0, "result_exact": "1.0",
+        })},
+        {"role": "tool", "name": "financial_rigor", "content": json.dumps({
+            "status": "ok", "command": "calc",
+            "expr": "a/b", "result": 1.0, "result_exact": "1.0",
+        })},
+    ]
+    from src.agent.loop import _verification_ledger
+    ledger = _verification_ledger(messages)
+    assert ledger.count("calc a/b") == 1
+
+
+def test_stall_timeout_seconds_default_and_override(monkeypatch) -> None:
+    """The stall watchdog timeout reads config and honors a module override."""
+    import src.agent.loop as loop_module
+
+    assert _stall_timeout_seconds() > 0
+    monkeypatch.setattr(loop_module, "STALL_TIMEOUT_SECONDS", 42.0, raising=False)
+    assert _stall_timeout_seconds() == 42.0
+    monkeypatch.delattr(loop_module, "STALL_TIMEOUT_SECONDS", raising=False)
+    assert _stall_timeout_seconds() > 0

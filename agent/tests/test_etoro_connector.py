@@ -14,6 +14,7 @@ from src.trading.connectors.etoro import sdk as etoro_sdk
 from src.trading.connectors.etoro.client import (
     EtoroClient,
     EtoroConfig,
+    EtoroConfigError,
     build_config,
     aggregate_portfolio_path,
     copy_root,
@@ -24,14 +25,18 @@ from src.trading.connectors.etoro.client import (
     set_client_factory,
 )
 from src.trading.connectors.etoro.classification import ETORO_TOOL_CLASS
-from src.trading.connectors.etoro.profiles import ETORO_EXTENDED_CAPABILITIES
+from src.trading.connectors.etoro.profiles import ETORO_EXTENDED_CAPABILITIES, ETORO_PAPER_TRADE_CAPABILITIES
 
 pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
 def _reset_etoro_client_factory() -> None:
+    from src.trading.connectors.etoro.instruments import reset_instrument_type_cache
+
+    reset_instrument_type_cache()
     yield
+    reset_instrument_type_cache()
     set_client_factory(None)
 
 
@@ -76,9 +81,14 @@ def test_etoro_profiles_registered() -> None:
     assert "orders.place.requires_mandate" in live.capabilities
 
 
-def test_trade_profile_lists_all_extended_capabilities() -> None:
-    trade = profiles.profile_by_id("etoro-paper-trade")
-    assert set(ETORO_EXTENDED_CAPABILITIES) <= set(trade.capabilities)
+def test_trade_profile_lists_capabilities_by_environment() -> None:
+    paper = profiles.profile_by_id("etoro-paper-trade")
+    live = profiles.profile_by_id("etoro-live-trade")
+    assert set(ETORO_PAPER_TRADE_CAPABILITIES) <= set(paper.capabilities)
+    assert "copy.start" not in paper.capabilities
+    assert "orders.place" in paper.capabilities
+    assert "copy.start" in live.capabilities
+    assert "orders.place.requires_mandate" in live.capabilities
 
 
 def test_demo_and_real_paths_separated() -> None:
@@ -91,9 +101,25 @@ def test_demo_and_real_paths_separated() -> None:
     assert info_root(paper).endswith("/demo")
     assert aggregate_portfolio_path(paper).endswith("/demo/aggregate-portfolio")
     assert aggregate_portfolio_path(live) == "/api/v1/trading/info/aggregate-portfolio"
-    assert copy_root(paper).endswith("/demo")
+    assert copy_root(live) == "/api/v2/trading/copy"
     assert positions_root(paper).endswith("/demo")
     assert paper.api_key == live.api_key
+
+
+def test_copy_root_refuses_a_paper_config() -> None:
+    """Copy has no demo path, so a paper config must get a refusal, not the real one.
+
+    Every other root encodes paper/live in the path. If ``copy_root`` simply
+    returned the real route for a paper config, the only thing keeping demo
+    credentials off the live copy endpoint would be each call site remembering
+    to check first.
+    """
+    paper = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    with pytest.raises(EtoroConfigError) as excinfo:
+        copy_root(paper)
+    assert "demo (paper)" in str(excinfo.value)
+    assert copy_root(EtoroConfig(profile="live-readonly", api_key="k", user_key="u"))
+    assert copy_root(EtoroConfig(profile="live", api_key="k", user_key="u"))
 
 
 def test_shared_credentials_across_paper_and_live_profiles(monkeypatch, tmp_path) -> None:
@@ -297,6 +323,8 @@ def test_classification_registered() -> None:
     assert classify_tool("unknown_etoro_op", None, curated) is ToolClass.UNKNOWN
     assert ETORO_TOOL_CLASS["copy_close"] is ToolClass.WRITE
     assert ETORO_TOOL_CLASS["get_instrument_metadata"] is ToolClass.READ
+    assert ETORO_TOOL_CLASS["get_instrument_types"] is ToolClass.READ
+    assert ETORO_TOOL_CLASS["list_instruments_by_type"] is ToolClass.READ
 
 
 def test_resolve_btc_uses_internal_symbol_full(monkeypatch) -> None:
@@ -347,6 +375,181 @@ def test_fuzzy_search_filters_sentinel_ids(monkeypatch) -> None:
     result = search_instruments("bitcoin", cfg, limit=5, mode="discover")
     assert result["status"] == "ok"
     assert result["instruments"][0]["instrument_id"] == 100000
+
+
+def test_crypto_query_browses_instrument_type_catalog(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        captured.append((url, dict(kwargs.get("params") or {})))
+        if "/instrument-types" in url:
+            return _FakeResponse(
+                200,
+                {"instrumentTypes": [{"instrumentTypeID": 10, "instrumentTypeDescription": "Crypto"}]},
+            )
+        if "/market-data/search" in url:
+            return _FakeResponse(200, {"items": []})
+        if "/market-data/instruments" in url and kwargs.get("params", {}).get("instrumentTypeIds") == 10:
+            return _FakeResponse(
+                200,
+                {
+                    "instrumentDisplayDatas": [
+                        {
+                            "instrumentID": 100000,
+                            "symbolFull": "BTC",
+                            "instrumentDisplayName": "Bitcoin",
+                            "instrumentTypeID": 10,
+                        },
+                        {
+                            "instrumentID": 5,
+                            "symbolFull": "00001.HK",
+                            "instrumentDisplayName": "CK Hutchison",
+                            "instrumentTypeID": 5,
+                        },
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request {method} {url} {kwargs.get('params')}")
+
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+    from src.trading.connectors.etoro.instruments import search_instruments
+
+    result = search_instruments("crypto", cfg, limit=5)
+    assert result["status"] == "ok"
+    assert result["mode"] == "type"
+    assert result["instrument_type_id"] == 10
+    assert result["instruments"][0]["symbol"] == "BTC"
+    assert all(row.get("instrument_type_id") == 10 for row in result["instruments"])
+    assert any(params.get("instrumentTypeIds") == 10 for _, params in captured)
+
+
+def test_stocks_query_uses_dynamic_type_catalog(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        if "/instrument-types" in url:
+            return _FakeResponse(
+                200,
+                {
+                    "instrumentTypes": [
+                        {"instrumentTypeID": 5, "instrumentTypeDescription": "Stocks"},
+                        {"instrumentTypeID": 10, "instrumentTypeDescription": "Crypto"},
+                    ],
+                },
+            )
+        if "/market-data/search" in url:
+            return _FakeResponse(200, {"items": []})
+        if kwargs.get("params", {}).get("instrumentTypeIds") == 5:
+            return _FakeResponse(
+                200,
+                {
+                    "instrumentDisplayDatas": [
+                        {
+                            "instrumentID": 1111,
+                            "symbolFull": "AAPL",
+                            "instrumentTypeID": 5,
+                        },
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+    from src.trading.connectors.etoro.instruments import search_instruments
+
+    result = search_instruments("equities", cfg, limit=5)
+    assert result["status"] == "ok"
+    assert result["instrument_type_id"] == 5
+    assert result["instruments"][0]["symbol"] == "AAPL"
+
+
+def test_get_instrument_types_reads_catalog(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        if "/instrument-types" in url:
+            return _FakeResponse(
+                200,
+                {
+                    "instrumentTypes": [
+                        {"instrumentTypeID": 1, "instrumentTypeDescription": "Forex"},
+                        {"instrumentTypeID": 10, "instrumentTypeDescription": "Crypto"},
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+    from src.trading.connectors.etoro.instruments import get_instrument_types
+
+    result = get_instrument_types(cfg)
+    assert result["status"] == "ok"
+    assert {row["instrument_type_id"] for row in result["instrument_types"]} == {1, 10}
+    assert result["instrument_types"][0]["label"] == "forex"
+
+
+def test_crypto_browse_can_attach_flat_market_data_rates(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="live-readonly", api_key="k", user_key="u")
+    captured_urls: list[str] = []
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        captured_urls.append(url)
+        if "/instrument-types" in url:
+            return _FakeResponse(
+                200,
+                {"instrumentTypes": [{"instrumentTypeID": 10, "instrumentTypeDescription": "Crypto"}]},
+            )
+        if "/market-data/search" in url:
+            return _FakeResponse(200, {"items": []})
+        if "/market-data/instruments" in url and "rates" not in url:
+            return _FakeResponse(
+                200,
+                {
+                    "instrumentDisplayDatas": [
+                        {
+                            "instrumentID": 100000,
+                            "symbolFull": "BTC",
+                            "instrumentTypeID": 10,
+                        },
+                    ],
+                },
+            )
+        if "/market-data/instruments/rates" in url:
+            return _FakeResponse(
+                200,
+                {"rates": [{"instrumentID": 100000, "bid": 1.0, "ask": 2.0, "lastExecution": 1.5}]},
+            )
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+    from src.trading.connectors.etoro.instruments import search_instruments
+
+    result = search_instruments("crypto", cfg, limit=5, include_rates=True)
+    assert result["instruments"][0]["quote"] == {"bid": 1.0, "ask": 2.0, "last": 1.5}
+    assert any("/market-data/instruments/rates" in url for url in captured_urls)
+    assert not any(url.endswith("/api/v1/instruments") for url in captured_urls)
+
+
+def test_get_quote_uses_flat_rates_on_readonly_profile(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="live-readonly", api_key="k", user_key="u")
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        if "/market-data/search" in url:
+            return _FakeResponse(200, {"items": [{"instrumentId": 100000, "internalSymbolFull": "BTC"}]})
+        if "/market-data/instruments/rates" in url:
+            return _FakeResponse(200, {"rates": [{"instrumentID": 100000, "bid": 1.0, "ask": 2.0}]})
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+    result = etoro_sdk.get_quote("BTC", config=cfg)
+    assert result["status"] == "ok"
+    assert result["quote"]["bid"] == 1.0
+
+    service_result = service.get_quote("BTC", "etoro-live-sdk-readonly", api_key="k", user_key="u")
+    assert service_result["status"] == "ok"
+    assert service_result["profile_id"] == "etoro-live-sdk-readonly"
+    assert service_result["quote"]["ask"] == 2.0
 
 
 def test_get_open_orders_reads_portfolio_orders(monkeypatch) -> None:
@@ -555,8 +758,18 @@ def test_edit_position_stops_supports_clear_contract(monkeypatch) -> None:
     }
 
 
-def test_copy_precheck_posts_eligibility(monkeypatch) -> None:
+def test_copy_rejected_on_paper_account() -> None:
     cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    from src.trading.connectors.etoro.copy_trading import COPY_TRADING_PAPER_UNSUPPORTED
+
+    result = etoro_sdk.copy_precheck(cfg, parent_cid=123, amount=100.0)
+    assert result["status"] == "error"
+    assert result["error_code"] == "copy_unavailable_on_paper"
+    assert COPY_TRADING_PAPER_UNSUPPORTED in result["error"]
+
+
+def test_copy_precheck_posts_eligibility(monkeypatch) -> None:
+    cfg = EtoroConfig(profile="live", api_key="k", user_key="u")
     captured: dict[str, Any] = {}
 
     def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
@@ -574,7 +787,7 @@ def test_copy_precheck_posts_eligibility(monkeypatch) -> None:
 
 
 def test_copy_start_posts_copy_root(monkeypatch) -> None:
-    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    cfg = EtoroConfig(profile="live", api_key="k", user_key="u")
     captured: dict[str, Any] = {}
 
     def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
@@ -599,7 +812,7 @@ def test_copy_start_posts_copy_root(monkeypatch) -> None:
 
 @pytest.mark.parametrize("reference_id", ["contains/slash", "x" * 36, ""])
 def test_copy_start_rejects_invalid_reference_id(reference_id: str) -> None:
-    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    cfg = EtoroConfig(profile="live", api_key="k", user_key="u")
 
     result = etoro_sdk.copy_start_or_adjust(
         cfg,
@@ -613,7 +826,7 @@ def test_copy_start_rejects_invalid_reference_id(reference_id: str) -> None:
 
 
 def test_copy_poll_gets_reference(monkeypatch) -> None:
-    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    cfg = EtoroConfig(profile="live", api_key="k", user_key="u")
     captured_url = ""
 
     def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
@@ -628,7 +841,7 @@ def test_copy_poll_gets_reference(monkeypatch) -> None:
 
 
 def test_copy_close_posts_close(monkeypatch) -> None:
-    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    cfg = EtoroConfig(profile="live", api_key="k", user_key="u")
     captured: dict[str, Any] = {}
 
     def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
@@ -689,7 +902,10 @@ def test_service_search_instruments(monkeypatch) -> None:
     cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
 
     def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
-        if kwargs.get("params", {}).get("search"):
+        params = kwargs.get("params") or {}
+        if params.get("internalSymbolFull") == "BTC":
+            return _FakeResponse(200, {"items": [{"instrumentId": 100000, "internalSymbolFull": "BTC"}]})
+        if params.get("search"):
             return _FakeResponse(200, {"items": [{"instrumentId": 100000, "internalSymbolFull": "BTC"}]})
         return _FakeResponse(200, {"items": []})
 

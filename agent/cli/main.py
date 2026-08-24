@@ -357,6 +357,7 @@ class InteractiveContext:
     last_recap_history_len: int = 0
     pending_prompt: Optional[str] = None
     pending_proposal: Optional[Dict[str, Any]] = None
+    pending_scheduled_proposal: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -759,8 +760,12 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     # numbered choice block isn't clobbered by the live region, and arm the
     # REPL to intercept the next reply (SPEC.md Consent §2).
     if captured_proposal:
-        ctx.pending_proposal = dict(captured_proposal)
-        _render_mandate_proposal(console, ctx.pending_proposal)
+        if captured_proposal.get("type") == "scheduled_research.proposal":
+            ctx.pending_scheduled_proposal = dict(captured_proposal)
+            _render_scheduled_proposal(console, ctx.pending_scheduled_proposal)
+        else:
+            ctx.pending_proposal = dict(captured_proposal)
+            _render_mandate_proposal(console, ctx.pending_proposal)
 
     ctx.history.append({"role": "user", "content": user_input})
     answer = (result.get("content") or "").strip()
@@ -1020,6 +1025,7 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         )
     console.print()
 
+
     for profile in profiles:
         ordinal = profile.get("ordinal", "?")
         label = profile.get("label", "")
@@ -1055,6 +1061,69 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         '  [bold]Pick a number to commit, or say "按 2 但每日笔数提到 10" to adjust.[/bold]'
     )
     console.print()
+
+
+def _render_scheduled_proposal(console: Any, proposal: Dict[str, Any]) -> None:
+    """Render the deterministic y/N confirmation block for a scheduled job."""
+    job = proposal.get("job") or {}
+    schedule = job.get("schedule") or {}
+    delivery = job.get("delivery") or {}
+    operation = proposal.get("operation")
+    verb = "创建" if operation == "create" else "取消"
+    channel_suffix = f" ({delivery.get('channel')})" if delivery.get("channel") else ""
+    console.print()
+    console.print(f"[bold orange1]定时研究确认 · {verb}[/bold orange1]")
+    console.print(f"  任务: {job.get('title') or job.get('id') or '?'}")
+    if operation == "create":
+        console.print(
+            f"  节奏: {schedule.get('expression')} · "
+            f"{schedule.get('timezone') or 'UTC'} · 截止 {schedule.get('end_at') or '无'}"
+        )
+        console.print(
+            f"  投递: {delivery.get('target_label') or '仅应用内'}{channel_suffix}"
+        )
+    console.print("[bold]确认执行？ [y/N][/bold]")
+
+
+def _handle_scheduled_proposal_reply(text: str, ctx: InteractiveContext) -> bool:
+    """Commit/discard an outstanding scheduled proposal before the model."""
+    token = text.strip().lower()
+    if token not in {"y", "yes", "确认", "n", "no", "取消", "放弃"}:
+        return False
+    proposal = ctx.pending_scheduled_proposal or {}
+    proposal_id = str(proposal.get("proposal_id") or "")
+    console = get_console()
+    try:
+        import httpx
+
+        from src.config.accessor import get_env_config, reset_env_config
+
+        reset_env_config()
+        api_config = get_env_config().api
+        base = api_config.vibe_trading_api_url.rstrip("/")
+        key = api_config.api_auth_key.strip()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        endpoint = "commit" if token in {"y", "yes", "确认"} else "discard"
+        response = httpx.post(
+            f"{base}/scheduled-runs/proposals/{proposal_id}/{endpoint}",
+            headers=headers,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if token in {"y", "yes", "确认"}:
+            action = "创建" if proposal.get("operation") == "create" else "取消"
+            console.print(
+                f"[green]定时研究任务已{action}:[/green] "
+                f"{result.get('committed_job_id') or '?'}"
+            )
+        else:
+            console.print("[dim]已放弃这次定时研究变更。[/dim]")
+    except Exception as exc:  # noqa: BLE001 - keep proposal open for retry
+        console.print(f"[red]定时研究确认失败:[/red] {exc}")
+        return True
+    ctx.pending_scheduled_proposal = None
+    return True
 
 
 def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str, Any]:
@@ -1266,6 +1335,13 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
             _trip_halt_from_repl(console, reason=f"repl turn: {text}")
             ctx.pending_proposal = None
             continue
+
+        # Scheduled research confirmation is a surface commit. Exact y/N
+        # replies are intercepted before the model; any other text remains a
+        # normal conversational adjustment request.
+        if ctx.pending_scheduled_proposal is not None and not text.startswith("/"):
+            if _handle_scheduled_proposal_reply(text, ctx):
+                continue
 
         # Mandate pick — when a proposal is outstanding, a bare numeric reply
         # is a COMMIT handled here (the model never sees it). An adjust reply

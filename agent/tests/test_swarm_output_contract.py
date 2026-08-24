@@ -346,6 +346,9 @@ class _ScriptedLLM:
     def stream_chat(self, messages, tools=None, timeout=None, on_text_chunk=None):
         return self._responses.pop(0)
 
+    def close(self) -> None:
+        """No-op: the scripted stub owns no HTTP client."""
+
 
 @pytest.mark.parametrize(
     ("result", "raises", "expected_event_status", "expected_worker_status"),
@@ -428,3 +431,98 @@ def test_collect_artifacts_rejects_symlink_escape(tmp_path: Path) -> None:
         pytest.skip("symlinks are not available on this platform")
 
     assert _collect_artifacts(artifact_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# ChatLLM lifecycle: run_worker must close the per-task LLM (regression #1141)
+# ---------------------------------------------------------------------------
+
+
+def test_run_worker_closes_llm_on_success(monkeypatch, tmp_path: Path) -> None:
+    """A successful run must close the per-task ChatLLM exactly once."""
+    import src.swarm.worker as worker_mod
+
+    registry = ToolRegistry()
+    registry.register(_ResultTool("done", raises=False))
+    monkeypatch.setattr(
+        worker_mod, "build_swarm_registry", lambda *args, **kwargs: registry
+    )
+    closed = []
+
+    class _TrackingLLM(_ScriptedLLM):
+        def close(self) -> None:
+            closed.append(1)
+
+    monkeypatch.setattr(
+        worker_mod, "ChatLLM", lambda *args, **kwargs: _TrackingLLM()
+    )
+
+    worker_result = run_worker(
+        agent_spec=SwarmAgentSpec(
+            id="analyst",
+            role="Analyst",
+            system_prompt="Analyse the result.",
+            tools=["market_probe"],
+            max_iterations=3,
+        ),
+        task=SwarmTask(
+            id="task", agent_id="analyst", prompt_template="Probe the market."
+        ),
+        upstream_summaries={},
+        user_vars={},
+        run_dir=tmp_path,
+    )
+    assert worker_result.status.value == "completed"
+    assert len(closed) == 1, f"close must be called exactly once, got {len(closed)}"
+
+
+def test_run_worker_closes_llm_on_tool_exception(monkeypatch, tmp_path: Path) -> None:
+    """close() must fire even when the run dies on a tool exception."""
+    import src.swarm.worker as worker_mod
+
+    registry = ToolRegistry()
+    registry.register(_ResultTool("boom", raises=True))
+    monkeypatch.setattr(
+        worker_mod, "build_swarm_registry", lambda *args, **kwargs: registry
+    )
+    closed = []
+
+    class _TrackingLLM(_ScriptedLLM):
+        def close(self) -> None:
+            closed.append(1)
+
+    monkeypatch.setattr(
+        worker_mod, "ChatLLM", lambda *args, **kwargs: _TrackingLLM()
+    )
+
+    worker_result = run_worker(
+        agent_spec=SwarmAgentSpec(
+            id="analyst",
+            role="Analyst",
+            system_prompt="Analyse the result.",
+            tools=["market_probe"],
+            max_iterations=3,
+        ),
+        task=SwarmTask(
+            id="task", agent_id="analyst", prompt_template="Probe the market."
+        ),
+        upstream_summaries={},
+        user_vars={},
+        run_dir=tmp_path,
+    )
+    assert worker_result.status.value == "incomplete"
+    assert len(closed) == 1, f"close must fire on failure path, got {len(closed)}"
+
+
+def test_chatllm_close_is_best_effort_noop_without_client() -> None:
+    """ChatLLM.close() must not raise when the provider adapter has no
+    closeable client (e.g. scripted/native adapters without root_client)."""
+    from src.providers.chat import ChatLLM
+
+    class _BareLLM:
+        def bind_tools(self, tools):
+            return self
+
+    llm = ChatLLM.__new__(ChatLLM)
+    llm._llm = _BareLLM()  # no root_client / client attributes
+    llm.close()  # must not raise

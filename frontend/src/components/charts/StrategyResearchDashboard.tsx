@@ -35,6 +35,7 @@ function timestamp(row: Record<string, string>): string {
 type ReportIdentity = {
   title: string;
   strategy: string;
+  strategyInferred: boolean;
   symbols: string[];
   startDate: string;
   endDate: string;
@@ -82,6 +83,7 @@ export function getStrategyReportIdentity(run: RunData): ReportIdentity {
   return {
     title: `${symbolLabel} · ${strategy}`,
     strategy,
+    strategyInferred: true,
     symbols,
     startDate,
     endDate,
@@ -224,8 +226,15 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
             <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-[#3676df]">{t("runDashboard.eyebrow")}</p>
             <span className="rounded-full border border-[#3676df]/20 bg-background/70 px-2.5 py-1 font-mono text-[10px] text-muted-foreground">RUN {run.run_id.slice(-8).toUpperCase()}</span>
           </div>
-          <h2 className="mt-4 max-w-4xl text-2xl font-semibold leading-tight tracking-[-0.025em] text-foreground md:text-[30px]">{identity.title}</h2>
-          {run.prompt && run.prompt !== identity.strategy && (
+          <div className="mt-4 flex max-w-4xl flex-wrap items-center gap-2">
+            <h2 className="text-2xl font-semibold leading-tight tracking-[-0.025em] text-foreground md:text-[30px]">{identity.title}</h2>
+            {identity.strategyInferred && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-[#ff8a3d]/30 bg-[#ff8a3d]/10 px-2 py-0.5 text-[11px] text-[#c25a14]">
+                {t("runDashboard.strategyInferred")}
+              </span>
+            )}
+          </div>
+          {run.prompt && (
             <p className="mt-2 max-w-4xl text-sm leading-6 text-muted-foreground">{compactPrompt(run.prompt)}</p>
           )}
           <div className="mt-5 flex flex-wrap gap-2 text-xs text-muted-foreground">

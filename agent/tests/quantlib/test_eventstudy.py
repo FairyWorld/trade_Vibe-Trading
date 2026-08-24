@@ -381,3 +381,47 @@ def test_post_event_only_window_is_allowed():
     result = event_study(returns, market, events, event_window=(1, 5))
     assert result.event_window == (1, 5)
     assert list(result.aar.index) == [1, 2, 3, 4, 5]
+
+# --- non-parametric tests (Corrado rank and Cowan sign) ---
+
+
+def test_corrado_rank_and_cowan_sign_detect_positive_reaction():
+    returns, market = _panel(seed=801)
+    event_day = returns.index[250]
+    # Inject positive abnormal returns in the event window for all assets
+    returns_injected = returns.copy()
+    for col in returns_injected.columns:
+        returns_injected.loc[event_day, col] += 0.05
+
+    events = [(s, event_day) for s in returns.columns]
+    result = event_study(returns_injected, market, events, event_window=(0, 2))
+
+    assert result.positive_car_fraction == pytest.approx(1.0)
+    assert result.cowan_sign_z > 2.0
+    assert result.cowan_sign_p_value < 0.05
+    assert result.corrado_rank_z > 2.0
+    assert result.corrado_rank_p_value < 0.05
+
+
+def test_corrado_rank_and_cowan_sign_single_event_safe_nan():
+    returns, market = _panel(seed=802)
+    event_day = returns.index[250]
+    events = [("S00", event_day)]
+    result = event_study(returns, market, events, event_window=(0, 2))
+
+    assert np.isnan(result.corrado_rank_z)
+    assert np.isnan(result.corrado_rank_p_value)
+    assert np.isnan(result.cowan_sign_z)
+    assert np.isnan(result.cowan_sign_p_value)
+    assert 0.0 <= result.positive_car_fraction <= 1.0
+
+
+def test_corrado_rank_and_cowan_sign_tolerate_nan_in_estimation_period():
+    returns, market = _panel(seed=803)
+    event_day = returns.index[250]
+    # Insert scattered NaNs in the pre-event estimation window
+    returns.iloc[50, 0] = np.nan
+    market.iloc[60] = np.nan
+    events = [(s, event_day) for s in returns.columns]
+    result = event_study(returns, market, events, event_window=(0, 2))
+    assert np.isfinite(result.positive_car_fraction)

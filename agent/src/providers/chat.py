@@ -5,10 +5,13 @@ ChatLLM is designed specifically for the AgentLoop ReAct cycle.
 
 from __future__ import annotations
 
+import asyncio
 import html
+import inspect
 import logging
 import os
 import re
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -296,6 +299,89 @@ class ChatLLM:
             reasoning_effort=runtime_cfg.langchain_reasoning_effort.strip().lower(),
         )
 
+    def close(self) -> None:
+        """Best-effort release of HTTP clients owned by this adapter.
+
+        LangChain may lend multiple adapters the same cached HTTPX clients.
+        Those process-scoped clients must remain open when one ``ChatLLM`` is
+        discarded. Only explicitly marked, Vibe-created clients are closed;
+        adapters without the ownership marker keep the legacy best-effort
+        behavior for compatibility.
+        """
+        for label, client in self._close_candidates():
+            close_fn = getattr(client, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(client, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    self._run_or_schedule_close(result, label)
+            except Exception:
+                logger.debug("ChatLLM.close: failed to close %s", label, exc_info=True)
+
+    async def aclose(self) -> None:
+        """Asynchronously release HTTP clients owned by this adapter."""
+        for label, client in self._close_candidates():
+            close_fn = getattr(client, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(client, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("ChatLLM.aclose: failed to close %s", label, exc_info=True)
+
+    def _close_candidates(self) -> list[tuple[str, Any]]:
+        """Return unique clients this wrapper is responsible for closing."""
+        llm = self._llm
+        if hasattr(llm, "_vibe_owned_http_clients"):
+            candidates = [
+                ("owned_http_client", client)
+                for client in llm._vibe_owned_http_clients
+            ]
+        else:
+            candidates = [
+                (attr, getattr(llm, attr, None))
+                for attr in ("root_client", "root_async_client", "client")
+            ]
+
+        unique: list[tuple[str, Any]] = []
+        seen: set[int] = set()
+        for label, client in candidates:
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            unique.append((label, client))
+        return unique
+
+    @staticmethod
+    def _run_or_schedule_close(awaitable: Any, label: str) -> None:
+        """Consume an async close from either synchronous or async code."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(awaitable)
+            return
+
+        task = loop.create_task(awaitable)
+
+        def _log_failure(done: asyncio.Task[Any]) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug(
+                    "ChatLLM.close: async close failed for %s", label, exc_info=True
+                )
+
+        task.add_done_callback(_log_failure)
+
     def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, timeout: Optional[int] = None) -> LLMResponse:
         """Call the LLM synchronously.
 
@@ -319,6 +405,7 @@ class ChatLLM:
         on_text_chunk: Optional[Any] = None,
         on_reasoning_chunk: Optional[Any] = None,
         timeout: Optional[int] = None,
+        idle_timeout_s: Optional[float] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         """Stream the LLM and optionally forward text deltas (e.g. thinking).
@@ -333,6 +420,9 @@ class ChatLLM:
             on_text_chunk: Optional callback ``(delta: str) -> None``.
             on_reasoning_chunk: Optional callback ``(delta: str) -> None``.
             timeout: Optional per-call timeout in seconds.
+            idle_timeout_s: Optional per-chunk idle timeout; when no stream
+                delta arrives for this long the call fails as a retryable
+                timeout instead of hanging the loop silently.
             should_cancel: Optional predicate polled per chunk; when it returns
                 True the stream stops early and the partial response is returned.
                 Lets a caller abort a live stream promptly (cooperative cancel).
@@ -347,7 +437,17 @@ class ChatLLM:
             pending_text = ""
             possible_dsml_text = True
             cancelled = False
+            last_chunk_ts = _time.monotonic()
             for chunk in llm.stream(messages, config=config):
+                now = _time.monotonic()
+                if idle_timeout_s and now - last_chunk_ts > idle_timeout_s:
+                    # No delta for too long: the provider is stalled, not
+                    # thinking. Raising a bare TimeoutError lets the wrapper
+                    # below convert it into a retryable ProviderStreamError.
+                    raise TimeoutError(
+                        f"no stream delta for {idle_timeout_s:.0f}s"
+                    )
+                last_chunk_ts = now
                 if should_cancel and should_cancel():
                     cancelled = True
                     break

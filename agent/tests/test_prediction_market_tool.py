@@ -674,6 +674,21 @@ class TestMarket:
         assert market["spread"] == 0.01
         assert market["volume_usd"] == pytest.approx(6306835.903025)
 
+    def test_non_finite_field_does_not_break_strict_json(self, monkeypatch):
+        """A market with a non-finite upstream field (e.g. an undefined
+        day-over-day change on a newly listed outcome) must not leak a bare
+        NaN/Infinity token into the envelope: the field normalizes to null
+        and the whole envelope stays valid strict (RFC 8259) JSON."""
+        market = _open_market()
+        market["oneDayPriceChange"] = "Infinity"
+        _install(monkeypatch, {"/markets/": market})
+        raw = PredictionMarketTool().execute(mode="market", ids=["2774056"])
+
+        assert "NaN" not in raw and "Infinity" not in raw
+        payload = json.loads(raw)
+        json.dumps(payload, allow_nan=False)  # raises if a non-finite value slipped through
+        assert payload["data"]["markets"][0]["one_day_probability_change"] is None
+
     def test_units_are_declared_on_every_envelope(self, monkeypatch):
         _install(monkeypatch, {"/markets/": _open_market()})
         units = _run(mode="market", ids=["2774056"])["units"]
@@ -992,7 +1007,25 @@ class TestHelpers:
         assert prediction_market_tool._json_list(raw) == expected
 
     @pytest.mark.parametrize(
-        "raw, expected", [("0.5", 0.5), (0.5, 0.5), (None, None), (True, None), ("x", None)]
+        "raw, expected",
+        [
+            ("0.5", 0.5),
+            (0.5, 0.5),
+            (None, None),
+            (True, None),
+            ("x", None),
+            # float() parses these as valid non-finite floats; _coerce_int
+            # already rejects the same tokens (see test_coerce_int below),
+            # so _to_float must reject them too rather than propagate
+            # inf/nan into a probability or JSON envelope.
+            ("nan", None),
+            ("NaN", None),
+            ("inf", None),
+            ("-inf", None),
+            ("Infinity", None),
+            (float("nan"), None),
+            (float("inf"), None),
+        ],
     )
     def test_to_float(self, raw, expected):
         assert prediction_market_tool._to_float(raw) == expected

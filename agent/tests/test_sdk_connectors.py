@@ -525,6 +525,57 @@ def test_binance_service_unconfigured(monkeypatch, tmp_path) -> None:
     assert result["connector"] == "binance"
 
 
+def test_binance_positions_replace_ld_wrappers_with_simple_earn(monkeypatch) -> None:
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "USDT": {"free": 12, "used": 0, "total": 12},
+                "LDBTC": {"free": 0, "used": 0.9, "total": 0.9},
+            }
+
+        def sapi_get_simple_earn_flexible_position(self, params):
+            assert params == {"size": 100}
+            return {"rows": [{"asset": "BTC", "totalAmount": "1.0"}]}
+
+    monkeypatch.setattr(bn, "_exchange", lambda _cfg: FakeExchange())
+    result = bn.get_positions(
+        bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly")
+    )
+
+    assert result["positions"] == [
+        {"symbol": "USDT", "quantity": 12.0, "free": 12.0, "used": 0.0, "source": "spot"},
+        {
+            "symbol": "BTC",
+            "quantity": 1.0,
+            "free": 0.0,
+            "used": 1.0,
+            "source": "simple_earn_flexible",
+        },
+    ]
+
+
+def test_binance_exchange_adjusts_for_server_time(monkeypatch) -> None:
+    captured = {}
+
+    class FakeExchange:
+        def __init__(self, config):
+            captured.update(config)
+
+        def set_sandbox_mode(self, enabled):
+            captured["sandbox"] = enabled
+
+    monkeypatch.setattr(bn, "_require_ccxt", lambda: SimpleNamespace(binance=FakeExchange))
+    monkeypatch.setattr(bn, "getproxies", lambda: {})
+
+    bn._exchange(bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly"))
+
+    assert captured["options"] == {
+        "adjustForTimeDifference": True,
+        "recvWindow": 10_000,
+    }
+    assert captured["sandbox"] is False
+
+
 # --------------------------------------------------------------------------- #
 # Futu (local OpenD gateway)
 # --------------------------------------------------------------------------- #

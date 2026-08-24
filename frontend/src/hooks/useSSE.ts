@@ -91,7 +91,7 @@ export function useSSE(config?: SSEConfig) {
       "attempt.cancelled",
       "message.received", "session.created",
       "goal.created", "goal.evidence", "goal.updated",
-      "mandate.proposal", "mandate.committed", "live.halted", "live.resumed", "live.action",
+      "mandate.proposal", "mandate.committed", "scheduled_research.proposal", "live.halted", "live.resumed", "live.action",
       "heartbeat", "done",
     ];
 

@@ -135,6 +135,7 @@ class AttemptStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass
@@ -336,6 +337,17 @@ class Attempt:
             reason: Optional free-text reason (usually ``"cancelled by user"``).
         """
         self.status = AttemptStatus.CANCELLED
+        self.completed_at = _utc_now_iso()
+        if reason:
+            self.error = reason
+
+    def mark_interrupted(self, reason: str = "") -> None:
+        """Mark the attempt as interrupted by process lifecycle.
+
+        Args:
+            reason: Optional explanation of the interruption.
+        """
+        self.status = AttemptStatus.INTERRUPTED
         self.completed_at = _utc_now_iso()
         if reason:
             self.error = reason

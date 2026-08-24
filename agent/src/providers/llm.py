@@ -18,6 +18,7 @@ from pydantic import PrivateAttr
 
 from src.config.accessor import get_env_config, reset_env_config
 from src.providers.capabilities import (
+    ProviderCapabilities,
     get_llm_credentials,
     get_provider_capabilities,
 )
@@ -264,12 +265,14 @@ if ChatOpenAI is not None:
         _vibe_api_key: str = PrivateAttr(default="")
         _vibe_ambient_header_names: tuple[str, ...] = PrivateAttr(default=())
         _vibe_has_explicit_authorization: bool = PrivateAttr(default=False)
+        _vibe_owned_http_clients: tuple[Any, ...] = PrivateAttr(default=())
 
         def __init__(
             self,
             *args: Any,
             vibe_provider: str | None = None,
             vibe_api_key: str | None = None,
+            vibe_owned_http_clients: Sequence[Any] | None = None,
             **kwargs: Any,
         ) -> None:
             """Initialize while retaining the resolved provider name."""
@@ -286,6 +289,7 @@ if ChatOpenAI is not None:
             super().__init__(*args, **kwargs)
             self._vibe_provider = vibe_provider
             self._vibe_api_key = vibe_api_key or ""
+            self._vibe_owned_http_clients = tuple(vibe_owned_http_clients or ())
             self._vibe_ambient_header_names = tuple(
                 name for name in ambient_names if name not in explicit_names
             )
@@ -794,6 +798,15 @@ def _build_native_deepseek(
     )
 
 
+def _native_deepseek_adapter_available() -> bool:
+    """Return whether the optional native DeepSeek adapter can be imported."""
+    try:
+        module = import_module("langchain_deepseek")
+    except Exception:  # noqa: BLE001 - optional adapter availability probe
+        return False
+    return callable(getattr(module, "ChatDeepSeek", None))
+
+
 # Anthropic model names discovered at runtime to reject the `temperature`
 # request field. Next-gen Claude models (e.g. claude-opus-5, claude-opus-4-8,
 # claude-sonnet-5) return HTTP 400 "`temperature` is deprecated for this model."
@@ -914,17 +927,81 @@ def _make_temperature_safe_anthropic(base_cls: type) -> type:
     return safe_cls
 
 
+# Effort is not universal across the Anthropic line. Fable 5, Opus 5, Opus
+# 4.5-4.8 and Sonnet 5 / 4.6 accept it; Haiku 4.5 and Sonnet 4.5 reject it
+# outright with
+#   400 invalid_request_error: This model does not support the effort parameter.
+#
+# That bites hardest in a swarm, where a per-agent ``model_name`` split
+# deliberately puts cheap models on the data-gathering seats: one global effort
+# setting then kills exactly those workers, and it fails as a hard 400 rather
+# than a warning.
+#
+# A positive allowlist, for the same reason ``top_level_reasoning_effort`` in
+# providers/capabilities.py is one: an unrecognised model gets nothing, because
+# the cost of a wrong entry is that every request to it fails, while the cost of
+# a missing one is only that the effort setting is inert there.
+_EFFORT_CAPABLE_ANTHROPIC: tuple[str, ...] = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+)
+
+
+def _anthropic_supports_effort(model: str) -> bool:
+    """Report whether an Anthropic model accepts the effort parameter.
+
+    Args:
+        model: The configured Anthropic model name.
+
+    Returns:
+        True when the model is on the allowlist above.
+    """
+    name = (model or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in _EFFORT_CAPABLE_ANTHROPIC)
+
+
+def _adapter_accepts_effort(chat_anthropic: type) -> bool:
+    """Report whether the installed langchain-anthropic exposes the field.
+
+    ``ChatAnthropic`` is configured with ``extra="ignore"``, so an unknown
+    keyword is dropped in silence rather than raising. pyproject allows
+    ``langchain-anthropic>=1.3.0``, and ``reasoning_effort`` arrived later --
+    without this check, an older install would swallow the value while the
+    caller still paid the temperature cost below, which is the worst of both.
+
+    Args:
+        chat_anthropic: The resolved ``ChatAnthropic`` class.
+
+    Returns:
+        True when the class declares a ``reasoning_effort`` field.
+    """
+    return "reasoning_effort" in getattr(chat_anthropic, "model_fields", {})
+
+
 def _build_anthropic(
     *,
     model: str,
     temperature: float,
     callbacks: Any = None,
+    effort: str = "",
 ) -> Any:
     """Build the native Anthropic Messages API adapter.
 
     Uses a temperature-safe subclass so models that deprecate the `temperature`
     field (e.g. claude-opus-5 / claude-sonnet-5) work transparently while models
     that still accept it keep the configured deterministic value.
+
+    `effort` is the configured LANGCHAIN_REASONING_EFFORT, forwarded only to
+    models that accept it (see `_anthropic_supports_effort`); an empty string
+    means unset.
     """
     try:
         module = import_module("langchain_anthropic")
@@ -936,13 +1013,30 @@ def _build_anthropic(
         ) from exc
 
     safe_anthropic = _make_temperature_safe_anthropic(chat_anthropic)
+    use_effort = (
+        bool(effort)
+        and _anthropic_supports_effort(model)
+        and _adapter_accepts_effort(chat_anthropic)
+    )
+    # Effort makes langchain-anthropic enable adaptive thinking, and the API
+    # then rejects any temperature other than 1:
+    #   `temperature` may only be set to 1 when thinking is enabled or in
+    #   adaptive mode
+    # The platform's default is 0.0, so temperature is omitted entirely
+    # whenever effort is in play. The temperature-safe wrapper above does not
+    # cover this: it handles models that reject `temperature` outright, not
+    # this thinking-conditional variant.
     return safe_anthropic(
         model=model,
         max_tokens=get_env_config().llm.anthropic_max_tokens,
-        temperature=temperature,
+        temperature=None if use_effort else temperature,
         timeout=get_env_config().llm.timeout_seconds,
         max_retries=get_env_config().llm.max_retries,
         callbacks=callbacks,
+        # Rendered by langchain-anthropic as output_config={'effort': ...}.
+        # Without it, Fable 5 and Opus 5 run at the default effort however
+        # LANGCHAIN_REASONING_EFFORT is set.
+        reasoning_effort=effort if use_effort else None,
         api_key=os.getenv("ANTHROPIC_API_KEY") or None,  # noqa: env-gate — native provider credential
         base_url=(
             os.getenv("ANTHROPIC_BASE_URL")  # noqa: env-gate — native provider endpoint
@@ -1016,6 +1110,12 @@ def _sync_provider_env() -> None:
         os.environ.pop("OPENAI_API_KEY", None)
         return
 
+    if provider in {"copilot", "github-copilot"}:
+        os.environ.pop("OPENAI_API_BASE", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+        os.environ.pop("OPENAI_API_KEY", None)
+        return
+
     creds = get_llm_credentials(provider, get_env_config().llm.langchain_model_name)
     api_key = creds["api_key"]
     base_url = creds["base_url"]
@@ -1028,34 +1128,45 @@ def _sync_provider_env() -> None:
         os.environ["OPENAI_BASE_URL"] = base_url
 
 
-def _supports_top_level_reasoning_effort(provider: str, caps_name: str) -> bool:
+def _supports_top_level_reasoning_effort(caps: ProviderCapabilities) -> bool:
     """Report whether a provider accepts a top-level ``reasoning_effort`` field.
 
-    Direct OpenAI is the only verified consumer: its ``gpt-5.6-*`` models reject
-    function tools on ``/v1/chat/completions`` unless the request carries an
-    explicit ``reasoning_effort`` — including the literal ``"none"``. Every other
-    OpenAI-compatible provider (DeepSeek, Gemini, Groq, DashScope/Qwen, Zhipu,
-    NVIDIA, Spark, MiniMax, …) may reject the unknown field, so this is a
-    positive allowlist, never "everything without ``openrouter_reasoning_body``".
-    Relays that take the field inside ``extra_body.reasoning`` (OpenRouter,
-    Requesty) keep that path and are excluded here.
+    Reads the ``top_level_reasoning_effort`` capability flag, which is a
+    positive allowlist: a provider is listed only once a real request to it has
+    been observed to succeed. Speaking the OpenAI wire format does not imply
+    accepting every OpenAI field, and an endpoint that validates its body
+    strictly rejects the unknown key outright — so the default is off and the
+    consequence of that default is a no-op, not a failed call.
+
+    Relays that take the effort inside ``extra_body.reasoning`` (OpenRouter,
+    Requesty) use that path instead and are excluded here.
 
     Args:
-        provider: Configured ``LANGCHAIN_PROVIDER`` value.
-        caps_name: Canonical capability name resolved for the provider/model.
+        caps: Canonical capabilities resolved for the provider and model. Note
+            this is the *resolved* capability, so provider ``openai`` with a
+            ``deepseek-*`` model arrives here as DeepSeek, and an unrecognised
+            provider name arrives as OpenAI — which is why callers must also
+            check the base URL before trusting the OpenAI entry.
 
     Returns:
-        True only for direct OpenAI. The configured name is checked alongside the
-        resolved capability because unknown provider names fall back to OpenAI
-        capabilities — an unverified gateway must not inherit the field — while
-        the capability name check drops model-inferred providers (e.g. provider
-        ``openai`` with a ``deepseek-*`` model resolves to DeepSeek).
+        True when the provider is on the allowlist and does not use the
+        ``extra_body.reasoning`` relay path.
     """
-    if caps_name != "openai" or provider.strip().lower() not in {"", "openai"}:
-        return False
-    # A base-URL override points the OpenAI client at some other gateway
-    # (Ollama, LiteLLM, a corporate proxy). Those speak the OpenAI wire format
-    # but need not accept this field, so the label alone is not enough.
+    return caps.top_level_reasoning_effort and not caps.openrouter_reasoning_body
+
+
+def _openai_label_points_at_openai(caps: ProviderCapabilities) -> bool:
+    """Report whether the OpenAI capability is actually talking to OpenAI.
+
+    An unknown ``LANGCHAIN_PROVIDER`` falls back to the OpenAI capabilities, and
+    a base-URL override points the OpenAI client at some other gateway (Ollama,
+    LiteLLM, a corporate proxy). Those speak the OpenAI wire format but need not
+    accept ``reasoning_effort``, so the label alone is not enough to send it.
+
+    Non-OpenAI capabilities are unaffected — they carry their own endpoint.
+    """
+    if caps.name != "openai":
+        return True
     try:
         base_url = (
             get_llm_credentials("openai", get_env_config().llm.langchain_model_name)
@@ -1068,6 +1179,36 @@ def _supports_top_level_reasoning_effort(provider: str, caps_name: str) -> bool:
         return True
     host = urlparse(base_url if "//" in base_url else f"https://{base_url}").hostname or ""
     return host.lower() in {"api.openai.com", "openai.com"}
+
+
+def _sends_top_level_reasoning_effort(caps: ProviderCapabilities) -> bool:
+    """Combine the allowlist flag with the OpenAI base-URL check."""
+    return _supports_top_level_reasoning_effort(caps) and _openai_label_points_at_openai(caps)
+
+
+def uses_responses_api(
+    provider: str,
+    configured_responses_api: bool | None,
+    deepseek_adapter: str | None = None,
+) -> bool:
+    """Return whether the configured provider uses ChatOpenAI's Responses route."""
+    if configured_responses_api is not True:
+        return False
+    normalized_provider = provider.strip().lower().replace("_", "-")
+    if normalized_provider in {"anthropic", "openai-codex"}:
+        return False
+    if normalized_provider != "deepseek":
+        return True
+    adapter = _deepseek_adapter_mode() if deepseek_adapter is None else deepseek_adapter.strip().lower()
+    adapter = {
+        "compat": "openai-compatible",
+        "compatible": "openai-compatible",
+        "openai": "openai-compatible",
+        "openai_compatible": "openai-compatible",
+    }.get(adapter, adapter)
+    if adapter == "openai-compatible":
+        return True
+    return adapter == "auto" and not _native_deepseek_adapter_available()
 
 
 def provider_diagnostics() -> dict[str, Any]:
@@ -1178,8 +1319,9 @@ def provider_diagnostics() -> dict[str, Any]:
             "send_reasoning_content": caps.send_reasoning_content,
             "gemini_thought_signatures": caps.gemini_thought_signatures,
             "openrouter_reasoning_body": caps.openrouter_reasoning_body,
-            "top_level_reasoning_effort": _supports_top_level_reasoning_effort(
-                provider, caps.name
+            "top_level_reasoning_effort": (
+                adapter_type == "openai-compatible"
+                and _sends_top_level_reasoning_effort(caps)
             ),
         },
     }
@@ -1216,11 +1358,20 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
             reasoning_effort=effort or None,
         )
 
+    if provider in {"copilot", "github-copilot"}:
+        from src.providers.copilot_auth import CopilotSDKLLM
+
+        return CopilotSDKLLM(
+            model=name,
+            timeout=get_env_config().llm.timeout_seconds,
+        )
+
     if provider == "anthropic":
         return _build_anthropic(
             model=name,
             temperature=temperature,
             callbacks=callbacks,
+            effort=get_env_config().llm.langchain_reasoning_effort.strip().lower(),
         )
 
     if provider == "deepseek":
@@ -1253,9 +1404,10 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     ):
         logger.info("Forcing temperature=1.0 for %s (provider requirement)", name)
         temperature = 1.0
-    # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
-    # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = get_env_config().llm.langchain_reasoning_effort.strip().lower()
+    # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
+    configured_responses_api = get_env_config().llm.langchain_use_responses_api
+    use_responses_api = uses_responses_api(provider, configured_responses_api)
     creds = get_llm_credentials(provider, name)
     api_key = creds["api_key"]
     _validate_authorization_credential(
@@ -1270,18 +1422,25 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "timeout": get_env_config().llm.timeout_seconds,
         "max_retries": get_env_config().llm.max_retries,
         "callbacks": callbacks,
-        "extra_body": (
-            {"reasoning": {"effort": effort}}
-            if effort and caps.openrouter_reasoning_body
+        "output_version": "responses/v1" if use_responses_api else None,
+        "use_responses_api": use_responses_api,
+        "reasoning": (
+            {"effort": effort}
+            if use_responses_api and effort
             else None
         ),
-        # Direct OpenAI takes the effort as a top-level request field instead
-        # (gpt-5.6-* require it, even "none", to accept function tools).
-        # None is dropped by langchain-openai, so unsupported providers keep a
-        # payload without the field.
+        "extra_body": (
+            {"reasoning": {"effort": effort}}
+            if effort and not use_responses_api and caps.openrouter_reasoning_body
+            else None
+        ),
         "reasoning_effort": (
             effort
-            if effort and _supports_top_level_reasoning_effort(provider, caps.name)
+            if (
+                effort
+                and not use_responses_api
+                and _sends_top_level_reasoning_effort(caps)
+            )
             else None
         ),
         "vibe_provider": provider,
@@ -1299,4 +1458,5 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         sync_client, async_client = _build_proxy_free_http_clients()
         kwargs["http_client"] = sync_client
         kwargs["http_async_client"] = async_client
+        kwargs["vibe_owned_http_clients"] = (sync_client, async_client)
     return ChatOpenAIWithReasoning(**kwargs)

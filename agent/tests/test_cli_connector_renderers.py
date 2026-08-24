@@ -150,3 +150,112 @@ def test_connector_check_uses_sdk_diagnostics_without_oauth_rows(capsys) -> None
     assert "OAuth token" not in out
     assert "Configured" not in out
     assert "Capabilities" not in out
+
+
+# --- #1150: `connector orders` had no coverage at all -------------------------
+#
+# `cmd_connector_orders` was written against the IBKR row shape
+# (``{"contract": ..., "order": ..., "status": {"status": ...}}``). broker_sdk
+# connectors return a flat row with ``symbol``/``side``/``quantity`` and a
+# plain-string ``status``, so every column but Account rendered empty. The
+# renderer had no test, which is why the whole column set could go blank
+# unnoticed.
+
+
+def test_enum_text_strips_sdk_enum_reprs_but_keeps_symbols_and_numbers() -> None:
+    # SDK enums arrive already stringified by the broker_sdk layer.
+    assert _legacy._enum_text("OrderSide.BUY") == "BUY"
+    assert _legacy._enum_text("OrderStatus.PARTIALLY_FILLED") == "PARTIALLY_FILLED"
+    # A class-name prefix must look like CamelCase, so class-B tickers survive.
+    assert _legacy._enum_text("BRK.B") == "BRK.B"
+    assert _legacy._enum_text("BRK.A") == "BRK.A"
+    # Decimals and already-plain values are returned untouched.
+    assert _legacy._enum_text("716.64") == "716.64"
+    assert _legacy._enum_text("BUY") == "BUY"
+    assert _legacy._enum_text(None) == ""
+
+
+def test_connector_orders_renders_flat_broker_sdk_row(capsys) -> None:
+    alpaca_result = {
+        "status": "ok",
+        "profile_id": "alpaca-paper-trade",
+        "open_orders": [
+            {
+                "account": "PA3ABCD",
+                "symbol": "AAPL",
+                "side": "OrderSide.BUY",
+                "order_type": "OrderType.LIMIT",
+                "quantity": 10,
+                "limit_price": 187.5,
+                "status": "OrderStatus.NEW",
+            }
+        ],
+    }
+    with patch("src.trading.service.get_open_orders", return_value=alpaca_result):
+        rc = _legacy.cmd_connector_orders("alpaca-paper-trade")
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "AAPL" in out       # symbol on the flat row, not under contract
+    assert "BUY" in out        # side → Action, enum prefix stripped
+    assert "LIMIT" in out      # order_type enum prefix stripped
+    assert "10" in out         # quantity → Qty
+    assert "187.5" in out      # limit_price
+    assert "NEW" in out        # plain-string status, enum prefix stripped
+    assert "OrderSide" not in out
+    assert "OrderStatus" not in out
+
+
+def test_connector_orders_keeps_class_b_ticker_intact(capsys) -> None:
+    result = {
+        "status": "ok",
+        "profile_id": "alpaca-paper-trade",
+        "open_orders": [
+            {
+                "account": "PA3ABCD",
+                "symbol": "BRK.B",
+                "side": "OrderSide.SELL",
+                "order_type": "OrderType.MARKET",
+                "quantity": 1,
+                "status": "OrderStatus.NEW",
+            }
+        ],
+    }
+    with patch("src.trading.service.get_open_orders", return_value=result):
+        rc = _legacy.cmd_connector_orders("alpaca-paper-trade")
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "BRK.B" in out  # must not be stripped to "B"
+    assert "SELL" in out
+
+
+def test_connector_orders_still_renders_the_nested_ibkr_row(capsys) -> None:
+    ibkr_result = {
+        "status": "ok",
+        "profile_id": "ibkr-local",
+        "open_orders": [
+            {
+                "contract": {"local_symbol": "MSFT", "symbol": "MSFT"},
+                "order": {
+                    "account": "DU123",
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "total_quantity": 100,
+                    "limit_price": 401.25,
+                },
+                "status": {"status": "PreSubmitted"},
+            }
+        ],
+    }
+    with patch("src.trading.service.get_open_orders", return_value=ibkr_result):
+        rc = _legacy.cmd_connector_orders("ibkr-local")
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "MSFT" in out
+    assert "DU123" in out
+    assert "LMT" in out
+    assert "100" in out
+    assert "401.25" in out
+    assert "PreSubmitted" in out  # the dict branch must survive the flat-row fix

@@ -49,8 +49,22 @@ def config_path() -> Path:
 
 
 def list_profiles() -> list[TradingProfile]:
-    """Return built-in trading connector profiles."""
-    return list(BUILTIN_PROFILES)
+    """Return built-in profiles plus operator-installed local read-only plugins.
+
+    Returns:
+        The built-in profiles, followed by the profile of every valid plugin
+        installed under the user's plugin root. A plugin never shadows a
+        built-in profile id, and an invalid manifest is skipped rather than
+        breaking the registry.
+    """
+    from src.trading.local_plugins import discover_plugins
+
+    plugins, _ = discover_plugins()
+    built_in_ids = {profile.id for profile in BUILTIN_PROFILES}
+    local_profiles = [
+        plugin.profile for plugin in plugins if plugin.profile.id not in built_in_ids
+    ]
+    return [*BUILTIN_PROFILES, *local_profiles]
 
 
 def profile_by_id(profile_id: str | None = None) -> TradingProfile:
@@ -66,7 +80,7 @@ def profile_by_id(profile_id: str | None = None) -> TradingProfile:
         ValueError: If the profile id is unknown.
     """
     target = (profile_id or load_selected_profile_id()).strip().lower()
-    for profile in BUILTIN_PROFILES:
+    for profile in list_profiles():
         if profile.id == target:
             return profile
     raise ValueError(f"unknown trading connector profile: {target}")

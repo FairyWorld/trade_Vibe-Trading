@@ -134,12 +134,16 @@ class TestFallbackChains:
     def test_all_expected_markets_present(self) -> None:
         expected = {
             "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
-            "ca_equity", "crypto", "futures", "fund", "macro", "forex",
+            "ca_equity", "vietnam_equity", "crypto", "futures", "fund", "macro",
+            "forex",
         }
         assert expected == set(FALLBACK_CHAINS.keys())
 
     def test_canada_chain_uses_only_compatible_sources(self) -> None:
         assert FALLBACK_CHAINS["ca_equity"] == ["yahoo", "yfinance", "local"]
+
+    def test_vietnam_chain_uses_only_compatible_sources(self) -> None:
+        assert FALLBACK_CHAINS["vietnam_equity"] == ["yahoo", "yfinance", "local"]
 
     def test_chains_are_non_empty(self) -> None:
         for market, chain in FALLBACK_CHAINS.items():
@@ -186,6 +190,15 @@ class TestFallbackChains:
         # mt5 heads the forex chain (terminal feed when attached), degrading to
         # the previous chain unchanged.
         assert FALLBACK_CHAINS["forex"] == ["mt5", "akshare", "yfinance", "local"]
+
+    def test_tickerall_is_explicit_only_never_a_fallback(self) -> None:
+        """TickerAll is a valid explicit source but must NEVER join an automatic
+        fallback chain. It reads a user's own broker account over a hosted API, so
+        it runs only on a deliberate ``source="tickerall"`` request - never silently
+        as a degradation target for another source. This guards that contract."""
+        assert "tickerall" in VALID_SOURCES
+        for market, chain in FALLBACK_CHAINS.items():
+            assert "tickerall" not in chain, f"tickerall must not be in the {market} fallback chain"
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +317,32 @@ class TestGetLoaderWithFallback:
         assert "local" in msg
         # The error must point the user at the Data Bridge config, not a network hop.
         assert "data-bridge" in msg.lower() or "config" in msg.lower()
+
+    def test_explicit_tickerall_does_not_fall_through_to_network(self) -> None:
+        """An explicit unavailable 'tickerall' must raise, never silently degrade to a
+        public forex source (akshare/yfinance) via its markets — it reads the user's own
+        broker account, so a missing key is a config error to surface, not paper over."""
+        class _FakeTickerall:
+            name = "tickerall"
+            markets = {"forex"}
+            requires_auth = True
+
+            def is_available(self) -> bool:
+                return False
+
+            def fetch(self, codes, start_date, end_date, *, interval="1D", fields=None):
+                return {}
+
+        with patch.dict(LOADER_REGISTRY, {
+            "tickerall": _FakeTickerall,
+            "fake_available": _FakeAvailableLoader,  # an available loader listed in the forex chain
+        }, clear=True):
+            with patch.dict(FALLBACK_CHAINS, {"forex": ["fake_available"]}):
+                with pytest.raises(NoAvailableSourceError) as excinfo:
+                    get_loader_cls_with_fallback("tickerall")
+        msg = str(excinfo.value)
+        assert "tickerall" in msg
+        assert "TICKERALL_API_KEY" in msg
 
 
 # ---------------------------------------------------------------------------

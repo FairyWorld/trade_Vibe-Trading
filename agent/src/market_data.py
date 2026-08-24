@@ -63,6 +63,32 @@ def get_loader(source: str):
     return get_loader_cls_with_fallback(source)
 
 
+# Canadian venue-alias helper: TSX (.TO) <-> TSX Venture (.V).
+#
+# A Canadian issuer lists on exactly one of the two venues. When a listing
+# moves (graduation TSX-V -> TSX, or the rarer reverse), Yahoo keeps only the
+# current venue's symbol; the old one 404s (HIVE.V -> HIVE.TO after HIVE
+# Digital Technologies graduated to the main board). ``fetch_market_data``
+# uses this to retry the sibling suffix before recording a symbol as
+# ``_unresolved``, so moved listings resolve without a manual yfinance detour.
+_CA_SUFFIX_RE = re.compile(r"^(?P<base>[A-Z0-9&.\-]+)\.(?P<suffix>TO|V)$", re.I)
+
+
+def _ca_venue_sibling(code: str) -> str | None:
+    """Return the other Canadian venue's symbol for a ``.TO``/``.V`` code.
+
+    ``HIVE.V`` -> ``HIVE.TO``, ``TD.TO`` -> ``TD.V``, ``BBD-B.TO`` ->
+    ``BBD-B.V`` (hyphenated class base preserved). Returns ``None`` for any
+    symbol that is not a Canadian ``.TO``/``.V`` ticker, so non-Canadian
+    lookups are never touched by the venue fallback.
+    """
+    match = _CA_SUFFIX_RE.match(code.strip())
+    if not match:
+        return None
+    sibling = "V" if match.group("suffix").upper() == "TO" else "TO"
+    return f"{match.group('base')}.{sibling}"
+
+
 def cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
     """Bound a per-symbol row list to keep tool payloads within budget."""
     n = len(records)
@@ -124,7 +150,7 @@ def fetch_market_data(
     """
     from backtest.engines._market_hooks import _detect_market
     from backtest.loaders.base import NoAvailableSourceError
-    from backtest.loaders.registry import FALLBACK_CHAINS
+    from backtest.loaders.registry import FALLBACK_CHAINS, _NO_NETWORK_FALLBACK_SOURCES
 
     results: dict[str, Any] = {}
     provenance: dict[str, dict[str, Any]] = {}
@@ -162,7 +188,16 @@ def fetch_market_data(
                 return chain
         return [src]
 
-    for (src, market), src_codes in groups.items():
+    def _fetch_via_chain(
+        src: str, market: str, src_codes: list[str]
+    ) -> tuple[dict[str, Any], str | None, type | None]:
+        """Run the ordered source chain for one group.
+
+        Returns ``(data_map, used_source, provider_cls)`` — ``data_map`` keyed
+        by requested symbol -> OHLCV frame (possibly empty), the source name
+        that actually served it, and the serving loader class (both ``None``
+        when every attempt failed).
+        """
         chain = _chain_for(src, market)
         # Start the attempt list with the requested source, then the rest of
         # the chain (preserving order, no duplicates).
@@ -203,29 +238,115 @@ def fetch_market_data(
                 "market-data source %r unavailable for %s; fell back to %r",
                 src, src_codes, used_source,
             )
+        return data_map, used_source, provider_cls
 
+    def _emit(
+        symbol: str,
+        df: Any,
+        *,
+        src: str,
+        used_source: str | None,
+        provider_cls: type | None,
+        market: str,
+        extra_provenance: dict[str, Any] | None = None,
+    ) -> None:
+        """Normalize one symbol's frame into ``results`` (+ provenance)."""
+        records = df.reset_index().to_dict(orient="records")
+        for row in records:
+            for key, value in row.items():
+                row[key] = _json_safe(value)
+        results[symbol] = cap_rows(records, max_rows)
+        if include_provenance:
+            volume_units = getattr(provider_cls, "volume_units", None) or {}
+            entry: dict[str, Any] = {
+                "source": used_source or src,
+                "requested_source": source,
+                "detected_source": src,
+                "fallback_used": bool(used_source and used_source != src),
+                "currency_conversion": "none",
+                "volume_unit": volume_units.get(market),
+            }
+            if extra_provenance:
+                entry.update(extra_provenance)
+            provenance[symbol] = entry
+
+    for (src, market), src_codes in groups.items():
+        data_map, used_source, provider_cls = _fetch_via_chain(src, market, src_codes)
         for symbol, df in data_map.items():
-            records = df.reset_index().to_dict(orient="records")
-            for row in records:
-                for key, value in row.items():
-                    row[key] = _json_safe(value)
-            results[symbol] = cap_rows(records, max_rows)
-            if include_provenance:
-                volume_units = getattr(provider_cls, "volume_units", None) or {}
-                provenance[symbol] = {
-                    "source": used_source or src,
-                    "requested_source": source,
-                    "detected_source": src,
-                    "fallback_used": bool(used_source and used_source != src),
-                    "currency_conversion": "none",
-                    "volume_unit": volume_units.get(market),
-                }
+            _emit(
+                symbol, df,
+                src=src, used_source=used_source, provider_cls=provider_cls, market=market,
+            )
 
     unresolved = [
         code
         for code in codes
         if code not in results and result_aliases[code] not in results
     ]
+
+    # Canadian venue-alias fallback: TSX (.TO) <-> TSX Venture (.V).
+    #
+    # A company lists on TSX or TSX-V, never both, so when one venue's symbol
+    # fails to resolve (e.g. Yahoo 404s HIVE.V after the issuer graduated to
+    # the main board), the sibling suffix is the only plausible re-listing.
+    # Retry the sibling through the same market chain before giving up, and
+    # key the result under the ORIGINAL requested symbol so the grounding/
+    # identity gate and callers still see evidence for exactly what was asked.
+    if unresolved:
+        for code in list(unresolved):
+            sibling = _ca_venue_sibling(code)
+            if sibling is None:
+                continue
+            src = detect_source(code) if source == "auto" else source
+            if src in _NO_NETWORK_FALLBACK_SOURCES:
+                # Explicit local/tickerall/qveris requests must not silently
+                # fall through to a network loader (registry contract).
+                continue
+            market = _detect_market(code)
+            if sibling in results:
+                # The sibling was already requested and resolved in this run —
+                # alias its bars under the requested code (no extra fetch).
+                results[code] = results[sibling]
+                if include_provenance:
+                    base = provenance.get(sibling, {})
+                    provenance[code] = {
+                        "source": base.get("source", src),
+                        "requested_source": source,
+                        "detected_source": src,
+                        "fallback_used": True,
+                        "currency_conversion": "none",
+                        "volume_unit": base.get("volume_unit"),
+                        "venue_fallback": True,
+                        "resolved_symbol": sibling,
+                    }
+                logger.info(
+                    "market-data venue alias %s -> %s (source=%s)", code, sibling, src,
+                )
+                unresolved.remove(code)
+                continue
+            # Sibling not already resolved — targeted re-fetch of just that
+            # symbol through the same market's source chain.
+            sibling_data, used_source, provider_cls = _fetch_via_chain(
+                src, market, [sibling]
+            )
+            if sibling_data:
+                df = next(iter(sibling_data.values()))
+                if df is not None and not df.empty:
+                    _emit(
+                        code, df,
+                        src=src, used_source=used_source, provider_cls=provider_cls,
+                        market=market,
+                        extra_provenance={
+                            "venue_fallback": True,
+                            "resolved_symbol": sibling,
+                        },
+                    )
+                    logger.info(
+                        "market-data venue fallback %s -> %s (source=%s)",
+                        code, sibling, src,
+                    )
+                    unresolved.remove(code)
+
     if unresolved:
         results["_unresolved"] = unresolved
     if include_provenance and provenance:

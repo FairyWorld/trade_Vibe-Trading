@@ -409,3 +409,45 @@ def test_create_rejects_a_blank_timezone_for_both_schedule_forms(
             json={"prompt": "scan", "schedule": schedule, "timezone": "   "},
         )
         assert response.status_code == 422, schedule
+
+
+def test_list_carries_the_last_verdict_record(
+    client: TestClient, store: ScheduledResearchJobStore
+):
+    from src.scheduled_research.verdict import VerdictItem, VerdictRecord
+
+    verdict = VerdictRecord(
+        session_id="sess-9",
+        recorded_at=1_700_000_100_000,
+        parse="ok",
+        outcome="DRIFT",
+        items=[VerdictItem(symbol="600519.SH", state="DRIFT", reason="band crossed")],
+        previous=VerdictRecord(
+            session_id="sess-8",
+            recorded_at=1_700_000_000_000,
+            parse="ok",
+            outcome="no_calls",
+            items=[],
+        ),
+    )
+    _seed(store, id="with-verdict", last_verdict=verdict)
+
+    response = client.get("/scheduled-runs")
+
+    assert response.status_code == 200
+    (row,) = response.json()
+    assert row["last_verdict"]["outcome"] == "DRIFT"
+    assert row["last_verdict"]["items"][0]["symbol"] == "600519.SH"
+    assert row["last_verdict"]["previous"]["outcome"] == "no_calls"
+
+
+def test_list_omits_verdict_when_never_recorded(
+    client: TestClient, store: ScheduledResearchJobStore
+):
+    _seed(store, id="no-verdict")
+
+    response = client.get("/scheduled-runs")
+
+    assert response.status_code == 200
+    (row,) = response.json()
+    assert row["last_verdict"] is None
