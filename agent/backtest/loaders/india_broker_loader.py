@@ -56,6 +56,13 @@ def _resolve_broker():
     crash in the loader registry.
     """
     try:
+        from src.trading.connectors.zerodha import sdk as zerodha_sdk
+
+        if zerodha_sdk.zerodha_available():
+            return "zerodha", zerodha_sdk
+    except Exception as exc:  # noqa: BLE001 — optional dependency / config
+        logger.debug("zerodha bridge unavailable: %s", exc)
+    try:
         from src.trading.connectors.shoonya import sdk as shoonya_sdk
 
         if shoonya_sdk.shoonya_available():
