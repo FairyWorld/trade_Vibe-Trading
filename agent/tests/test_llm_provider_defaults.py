@@ -25,6 +25,7 @@ EXPECTED_PROVIDER_DEFAULTS = {
     "nvidia": "nvidia/nemotron-3-ultra-550b-a55b",
     "gemini": "gemini-3.5-flash",
     "groq": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "novita": "moonshotai/kimi-k3",
     "dashscope": "qwen-plus-latest",
     "qwen": "qwen-plus-latest",
     "zhipu": "glm-5.1",

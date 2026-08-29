@@ -98,13 +98,17 @@ class AttributionBreakdown:
 
 @dataclass(frozen=True)
 class ShadowBacktestResult:
-    """Output of multi-market shadow backtest + attribution."""
+    """Output of multi-market shadow backtest + attribution.
+
+    ``shadow_total_pnl``/``delta_pnl`` are None when the runner produced no
+    usable metrics; a failed comparison must never render as 0.0.
+    """
 
     shadow_id: str
     per_market: dict[str, dict[str, float]]
     combined: dict[str, float]
     equity_curves: dict[str, list[tuple[str, float]]]
     attribution: AttributionBreakdown
-    shadow_total_pnl: float
+    shadow_total_pnl: float | None
     real_total_pnl: float
-    delta_pnl: float
+    delta_pnl: float | None

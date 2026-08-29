@@ -59,6 +59,15 @@ _SYMBOL_ARGUMENT_KEYS = {
 # many candidates by design. Requiring a locked identity there stalls every
 # discovery task before it can load a screening skill, which is #955.
 _RESOLUTION_INCOMPLETE_STATUSES = {"unresolved", "conflicting", "invalidated"}
+# Bounded read-only recovery (#1081): a missing instrument identity or price
+# evidence is often recoverable deterministically, so the loop should keep
+# driving the original task through `search_symbol` and `get_market_data`
+# instead of handing the user a terminal "confirm and continue" fallback.
+# These budgets are separate from the rejected-draft count so real recovery
+# progress is never cut off at the three-draft retry cap.
+MAX_GROUNDING_RECOVERY_ROUNDS = 6
+MAX_SYMBOL_RESOLUTION_ATTEMPTS = 2
+MAX_PRICE_EVIDENCE_ATTEMPTS = 3
 _PRICE_FIELDS = {"open", "high", "low", "close", "adj_close", "price"}
 _TIMESTAMP_FIELDS = ("trade_date", "date", "datetime", "timestamp", "time", "index")
 _MAX_GENERIC_EVIDENCE = 2_000
@@ -79,7 +88,16 @@ _CSV_DATE_COLUMNS = {"date", "datetime", "trade_date", "timestamp", "index"}
 # Filename -> symbol mapping for run-dir CSVs. The bash workaround writes each
 # series with a filesystem-safe stem: ``BYN_V.csv`` for ``BYN.V``, ``PDI_TO.csv``
 # for ``PDI.TO``, ``GC_F.csv`` for ``GC=F``.
-_CSV_FILENAME_SUFFIX_MAP = (("_V", ".V"), ("_TO", ".TO"), ("_F", "=F"))
+_CSV_FILENAME_SUFFIX_MAP = (
+    ("_V", ".V"),
+    ("_TO", ".TO"),
+    ("_F", "=F"),
+    # A US name is written ``INTC_US.csv`` by the same workaround, and
+    # ``.US`` is the venue suffix the rest of the project resolves on. Without
+    # this row the CSV was ingested as no evidence at all, so every price the
+    # run had actually fetched came back "numeric_claim_unavailable".
+    ("_US", ".US"),
+)
 
 # Only ``get_market_data`` returns bars whose columns are already the canonical
 # OHLC field names. Every other market-sensitive tool nests its quote somewhere,
@@ -192,14 +210,44 @@ _RATE_FORMULA_IDENTITY_RE = re.compile(
     r"\b[01](?=\s*[-+]\s*(?:[A-Za-z_][A-Za-z0-9_]*_?rate\b|[^\d\s()+*/=-]{0,12}(?:成本率|费率|税率|滑点率)))",
     re.IGNORECASE,
 )
-_DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b")
+# re.ASCII keeps ``\b`` a *byte* word boundary. Without it, ``\w`` is
+# Unicode-aware and CJK letters count as word characters, so a date that runs
+# straight into Chinese text -- "(2026-07-14最低)" -- has no boundary after
+# "14" and is left unmasked, contributing 2026/7/14 as candidate prices that
+# reject a correct report (#1122).
+_DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", re.ASCII)
 # A year-less "8/5" is how a trading day is written in running prose, and it
 # contributed 8 and 5 as candidate prices (#983). The month and day ranges are
 # bounded, and both sides are fenced off from a longer slash run, so the window
-# enumeration "20/50/200-day" cannot be mistaken for a date.
+# enumeration "20/50/200-day" cannot be mistaken for a date. Reports also write
+# the same day as "08-10(一)" or "08-10盘中"; that dash form is masked by
+# ``_DASH_DATE_RE`` below, where a zero-padded month or a weekday/session
+# marker is required so a quoted price range like "8-10 元" stays checkable.
 _SHORT_DATE_RE = re.compile(
     r"(?<![\d/])(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?![\d/])"
 )
+# A report writes a trading day as "08-10(一)" or "08-10盘中", and the dash form
+# leaked 8 and 10 as candidate prices exactly as "8/5" once did. The dash is
+# NOT symmetric with the slash, though: it also separates a range, and "目标价
+# 10-20 元" must stay checkable. So the two halves are split -- a zero-padded
+# month (01-09) is a formatting intent no price range imitates, while 10/11/12
+# have to carry a weekday or session marker to read as a date.
+_DASH_DATE_RE = re.compile(
+    r"(?<![\d/-])(?:"
+    r"0[1-9]-(?:0[1-9]|[12]\d|3[01])"
+    r"|1[0-2]-(?:0[1-9]|[12]\d|3[01])"
+    r"(?=\s*(?:[(（]\s*(?:周|星期)?[一二三四五六日天]\s*[)）]"
+    r"|盘中|盘后|盘前|收盘|开盘|最低|最高"
+    r"|\s*(?:close|open|intraday|low|high)\b))"
+    r")(?![\d/-])",
+    re.IGNORECASE,
+)
+# A level stated as a RANGE has the same shape: the separator touches the
+# second number, so masking "目标价 10" left "-20" behind and a negative price
+# matches no OHLC window at all -- a guaranteed rejection of a correct draft.
+# The tail is optional, so a single-value level is unaffected.
+_RANGE_TAIL = r"(?:\s*[-–—~～至到]\s*[-+]?\d[\d,]*(?:\.\d+)?)?"
+
 # A percentage range masks only its upper bound through the "%" tail check
 # below, because the sign touches the second number: "1–2%" left 1 behind
 # (#983). Mask the span as a whole.
@@ -270,6 +318,32 @@ _INDICATOR_VALUE_RE = re.compile(
 # it, the number survives masking and is compared against observed OHLC as a
 # price claim even though it is a prospective level, not an observed quote.
 _CURRENCY_TOKEN = r"(?:\$|US\$|C\$|HK\$|CAD|USD|CNY|HKD|¥|￥)?"
+
+# An order line is an instruction, not an observation. "100 @ $3.50" states
+# where a limit sits and "100" is a share count that was never a price at all,
+# yet both went to the OHLC check and rejected a weekly update whose quotes
+# were correct. This is the same category as the target/stop levels below -- a
+# level the report proposes, not one the data source reported.
+_ORDER_LEVEL_RE = re.compile(
+    r"(?:"
+    # (a) "<qty> [股|shares] @ <price>" -- the whole clause, quantity included
+    r"\d[\d,]*(?:\.\d+)?\s*(?:股|shares?)?\s*@\s*"
+    + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?"
+    r"|"
+    # (b) an order label, optionally carrying its own "<qty> @", then the level.
+    # There is deliberately no bare "@ <price>" branch: dates are masked before
+    # this runs, so "收盘 2026-08-10 @ 8.20" would arrive here as "@ 8.20" and a
+    # genuinely observed close would stop being checked. 买入价 / 卖出价 are
+    # absent for the same reason -- in running prose they name a price the
+    # report says it observed, not an instruction it proposes.
+    r"(?:挂单|限价单|限价|委托价?|订单"
+    r"|limit\s+(?:order|price)|\bGTC\b|\bGTD\b|\bIOC\b|\bFOK\b)"
+    r"\s*(?:为|是|at|=)?\s*[:：]?\s*"
+    r"(?:\d[\d,]*(?:\.\d+)?\s*(?:股|shares?)?\s*@\s*)?"
+    + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?"
+    r")" + _RANGE_TAIL,
+    re.IGNORECASE,
+)
 # A historical reference names a price the instrument once traded at — an
 # all-time high, a 52-week extreme — and the answer is not claiming it as
 # today's observed quote. "8/12 高 149.60 为 6/16 ATH 225.64 以来最高" was
@@ -288,7 +362,7 @@ _REFERENCE_LEVEL_RE = re.compile(
     r"上市以来(?:最高|最低)(?:点|位|价)?"
     r")"
     r"\s*(?:of|为|是|约|at)?\s*[:：]?\s*\(?"
-    r"\s*" + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?",
+    r"\s*" + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?" + _RANGE_TAIL,
     re.IGNORECASE,
 )
 # A date-anchored reference puts the historical extreme after the number:
@@ -354,18 +428,19 @@ _PROSPECTIVE_LEVEL_RE = re.compile(
     r"(?:"
     # (a) comparison operator immediately before the number
     r"(?:>=|<=|≥|≤|>|<|大于|小于|不低于|不高于|高于|低于)"
-    r"\s*" + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?"
-    r"|"
+    r"\s*" + _CURRENCY_TOKEN + r"\s*[-+]?\d[\d,]*(?:\.\d+)?" + _RANGE_TAIL
+    + r"|"
     # (b) a level marker introducing the number
     r"(?:目标位|目标区|目标价|均值目标(?:价)?|平均目标(?:价)?|止损位?|止盈位?|触发价|触发位|触发点|上看|下看|"
     r"支撑(?:阶梯|位|线)?|阻力(?:位|线)?|压力位|压力线|support(?:\s+(?:level|line|zone))?|"
     r"resistance(?:\s+(?:level|line|zone))?|target\s+(?:price|level|zone)|trigger|stop[-\s]?loss|take[-\s]?profit)"
     r"\s*(?:为|是|至|到|on|at|of|=)?\s*[:：]?\s*"
     + _CURRENCY_TOKEN
-    + r"\s*[-+]?\d[\d,]*(?:\.\d+)?"
-    r"|"
+    + r"\s*[-+]?\d[\d,]*(?:\.\d+)?" + _RANGE_TAIL
+    + r"|"
     # (c) the number followed by a level marker
-    r"" + _CURRENCY_TOKEN + r"[-+]?\d[\d,]*(?:\.\d+)?\s*(?:一线|附近)?\s*(?:成为?|作为|是)?\s*"
+    r"" + _CURRENCY_TOKEN + r"[-+]?\d[\d,]*(?:\.\d+)?" + _RANGE_TAIL
+    + r"\s*(?:一线|附近)?\s*(?:成为?|作为|是)?\s*"
     r"(?:目标区|目标位|止损位|止盈位)"
     r"|"
     # (d) a conditional opener before the number, digits fencing the reach
@@ -378,6 +453,8 @@ _PROSPECTIVE_LEVEL_RE = re.compile(
 # parentheses are deliberately not separators: an explicit derivation such as
 # "(8.5 - 7.9) / 2" must stay in one segment for the formula check.
 _CLAUSE_SEPARATOR_RE = re.compile(r"[,，;；。、\n（）【】]")
+
+
 # The ASCII comma both separates clauses and groups thousands, and the clause
 # split ran first: "收盘价 ¥1,309.22" became a clause ending in "¥1", whose 1 was
 # compared against the observed 1300.01–1363.35 range and rejected as a
@@ -513,9 +590,10 @@ def _symbol_from_csv_filename(stem: str) -> str | None:
     """Map a run-dir CSV stem back to a canonical project symbol.
 
     The bash workaround writes filesystem-safe stems: ``BYN_V.csv`` -> ``BYN.V``,
-    ``PDI_TO.csv`` -> ``PDI.TO``, ``GC_F.csv`` -> ``GC=F``. A stem without a
-    recognized suffix (e.g. a bare US name ``AAPL``) maps to None because the
-    project convention requires an explicit venue suffix.
+    ``PDI_TO.csv`` -> ``PDI.TO``, ``GC_F.csv`` -> ``GC=F``, ``INTC_US.csv`` ->
+    ``INTC.US``. A stem without a recognized suffix (e.g. a bare US name
+    ``AAPL``) maps to None because the project convention requires an explicit
+    venue suffix.
 
     Args:
         stem: CSV filename without the ``.csv`` extension.
@@ -581,10 +659,58 @@ def _coerce_csv_number(value: Any) -> int | float | None:
 
 # "." is deliberately not a separator: a decimal price such as 8.5 would parse
 # as month 8 day 5 and match a real trading day.
+# A report writes the day as a table cell -- "08-10(一)", "08-10(周一)盘中",
+# "08-10盘中" -- and the weekday or session suffix made the cell match no
+# evidence row at all, so every price in that row came back
+# "numeric_claim_unavailable" even though the run had fetched the bar.
+_TRADING_DAY_SUFFIX = (
+    r"(?:\s*[(（]\s*(?:周|星期)?[一二三四五六日天]\s*[)）])?"
+    r"\s*(?:盘中|盘后|盘前|收盘|开盘|早盘|尾盘)?"
+)
 _YEARLESS_CLAIM_DATE_RE = re.compile(
-    r"^(0?[1-9]|1[0-2])\s*[-/月]\s*(0?[1-9]|[12]\d|3[01])\s*[日号]?$"
+    r"^(0?[1-9]|1[0-2])\s*[-/月]\s*(0?[1-9]|[12]\d|3[01])\s*[日号]?"
+    + _TRADING_DAY_SUFFIX
+    + r"$"
+)
+# Two-digit day alternatives are tried before a bare digit so an
+# unanchored prefix match consumes the full day ("10" of "08-10(一)")
+# instead of stopping at "1".
+_ISO_CLAIM_DATE_PREFIX_RE = re.compile(
+    r"^\s*((?:19|20)\d{2})\s*[-/]\s*(0?[1-9]|1[0-2])\s*[-/]\s*([12]\d|3[01]|0?[1-9])"
+)
+_YEARLESS_CLAIM_DATE_PREFIX_RE = re.compile(
+    r"^\s*(0?[1-9]|1[0-2])\s*[-/月]\s*([12]\d|3[01]|0?[1-9])"
 )
 _ISO_TIMESTAMP_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})")
+
+
+def _claim_date_tuple(date_value: str) -> tuple[int, int] | None:
+    """Extract the (month, day) named by a report-style date cell.
+
+    Reports routinely annotate a trading day: the date column reads
+    ``08-10(一)``, ``08-10(周一)盘中`` or ``08-10盘中`` rather than the bare
+    ``08-10`` the strict full-cell matchers accept. Any leading month-day (or
+    full ISO date) prefix is therefore accepted so such a claim still compares
+    against the matching evidence row instead of being reported as
+    unevidenced.
+
+    Args:
+        date_value: Date cell as written in the answer.
+
+    Returns:
+        The (month, day) tuple, or None when no date prefix is present.
+    """
+    claim = (date_value or "").strip()
+    match = _YEARLESS_CLAIM_DATE_RE.match(claim)
+    if match:
+        return (int(match.group(1)), int(match.group(2)))
+    match = _ISO_CLAIM_DATE_PREFIX_RE.match(claim)
+    if match:
+        return (int(match.group(2)), int(match.group(3)))
+    match = _YEARLESS_CLAIM_DATE_PREFIX_RE.match(claim)
+    if match:
+        return (int(match.group(1)), int(match.group(2)))
+    return None
 
 
 def _timestamp_matches_claim_date(timestamp: str, date_value: str) -> bool:
@@ -597,11 +723,12 @@ def _timestamp_matches_claim_date(timestamp: str, date_value: str) -> bool:
     evidence while that evidence sat right there (#983: 79 such rejections in
     one run, every value inside the observed range).
 
-    A year-less date is matched on month and day. That is deliberately looser:
-    where the evidence spans more than one year, such a claim matches the same
-    calendar day in either. Matching the wrong year is a smaller failure than
-    matching nothing, but it is a real one, so the caller still compares the
-    value against every record that matched rather than trusting the date.
+    A year-less date is matched on month and day, and a date cell may carry
+    weekday or intraday annotations (``08-10(一)``, ``08-10盘中``) whose
+    leading month-day is still recognized. Matching the wrong year is a
+    smaller failure than matching nothing, but it is a real one, so the
+    caller still compares the value against every record that matched rather
+    than trusting the date.
 
     Args:
         timestamp: Evidence timestamp, normally ISO ``YYYY-MM-DD``.
@@ -616,14 +743,11 @@ def _timestamp_matches_claim_date(timestamp: str, date_value: str) -> bool:
         return False
     if stamp.startswith(claim):
         return True
-    yearless = _YEARLESS_CLAIM_DATE_RE.match(claim)
+    claim_tuple = _claim_date_tuple(claim)
     iso = _ISO_TIMESTAMP_RE.match(stamp)
-    if not yearless or not iso:
+    if claim_tuple is None or not iso:
         return False
-    return (int(iso.group(2)), int(iso.group(3))) == (
-        int(yearless.group(1)),
-        int(yearless.group(2)),
-    )
+    return (int(iso.group(2)), int(iso.group(3))) == claim_tuple
 
 
 def _price_field_for_path(path: str) -> str | None:
@@ -825,6 +949,9 @@ class GroundingLedger:
         self._evidence: list[EvidenceRecord] = []
         self._tool_failures: list[dict[str, Any]] = []
         self._validations: list[dict[str, Any]] = []
+        self._recovery_rounds = 0
+        self._symbol_resolution_attempts = 0
+        self._price_evidence_attempts = 0
         self._ingested_csvs: set[str] = set()
         self._identity_required = bool(_ACTIONABLE_MARKET_RE.search(user_message))
         self._buffer_output = self._identity_required
@@ -893,6 +1020,18 @@ class GroundingLedger:
             "status": self.identity_status,
             "authorized_symbols": sorted(self.authorized_symbols),
             "records": [asdict(record) for record in self._identities.values()],
+            "recovery": self.recovery_summary(),
+        }
+
+    def recovery_summary(self) -> dict[str, Any]:
+        """Return bounded-recovery budget state for traces and the artifact."""
+        return {
+            "rounds": self._recovery_rounds,
+            "max_rounds": MAX_GROUNDING_RECOVERY_ROUNDS,
+            "symbol_resolution_attempts": self._symbol_resolution_attempts,
+            "max_symbol_resolution_attempts": MAX_SYMBOL_RESOLUTION_ATTEMPTS,
+            "price_evidence_attempts": self._price_evidence_attempts,
+            "max_price_evidence_attempts": MAX_PRICE_EVIDENCE_ATTEMPTS,
         }
 
     def authorize_tool_call(
@@ -1143,16 +1282,132 @@ class GroundingLedger:
         ]
         for issue in validation.issues[:12]:
             lines.append(f"- {issue.get('message', issue.get('code', 'grounding error'))}")
+        # Name the exact values that must be REMOVED, not rephrased. The model
+        # tends to restate a rejected figure in a new format; the gate then
+        # rejects it again and the run burns iterations until the fallback.
+        banned: list[str] = []
+        for issue in validation.issues:
+            code = issue.get("code")
+            value = issue.get("value")
+            if code in {"numeric_claim_conflict", "numeric_claim_unavailable", "unsourced_symbol_figures"} and value is not None:
+                symbol = issue.get("symbol") or ""
+                label = f"{value:g}" if isinstance(value, (int, float)) else str(value)
+                banned.append(f"{label} ({symbol})" if symbol else label)
+        if banned:
+            deduped = list(dict.fromkeys(banned))
+            lines.append(
+                "REMOVE these rejected value(s) entirely - do NOT restate, rephrase, "
+                "or recompute them in any other format: " + ", ".join(deduped) + "."
+            )
+            repeated: list[str] = []
+            for prior in self._validations:
+                for prior_issue in prior.get("issues", []):
+                    prior_value = prior_issue.get("value")
+                    if isinstance(prior_value, (int, float)):
+                        mark = f"{prior_value:g}"
+                        if any(entry.startswith(mark) for entry in deduped):
+                            repeated.append(mark)
+            if repeated:
+                lines.append(
+                    "These value(s) have now been rejected repeatedly across drafts: "
+                    + ", ".join(dict.fromkeys(repeated))
+                    + ". Repeating them in any form keeps failing; drop them, or show "
+                    "the full derivation from the observed inputs."
+                )
         lines.extend(
             [
+                "If a value is a derived or prospective level (stop, target, entry, etc.), "
+                "you must EITHER show the full derivation with the observed inputs and the "
+                "formula, OR omit it from the draft.",
                 "Reuse the exact locked symbol and venue.",
-                "For every derived number, label it as derived and show the source inputs and formula.",
                 "Do not attach figures to a symbol no tool call in this session handled; "
                 "report it as not retrieved instead.",
-                "If evidence is unavailable or conflicting, say so and ask for clarification; do not guess.",
             ]
         )
+        recovery = self.recovery_action(validation)
+        if recovery == _RESOLVER_TOOL:
+            lines.extend(
+                [
+                    "Instrument identity is unresolved. Call `search_symbol` for the "
+                    "candidate name in a separate tool-call turn, lock the exact canonical "
+                    "symbol and venue it returns, then call `get_market_data` before finalizing.",
+                    "Do NOT ask the user to confirm or continue while this read-only recovery "
+                    "remains available.",
+                ]
+            )
+        elif recovery == "get_market_data":
+            lines.extend(
+                [
+                    "Identity is locked but price evidence is missing. Call `get_market_data` "
+                    "for the locked canonical symbol and venue in a separate tool-call turn, "
+                    "then regenerate and re-validate the final answer.",
+                    "Do NOT ask the user to confirm or continue while this read-only recovery "
+                    "remains available.",
+                ]
+            )
+        else:
+            lines.append(
+                "If evidence is genuinely unavailable or conflicting and recovery is "
+                "exhausted, say so and ask for clarification; do not guess."
+            )
         return "\n".join(lines)
+
+    def recovery_action(self, validation: ValidationResult) -> str | None:
+        """Decide the next safe read-only recovery step for a rejected draft.
+
+        Returns ``search_symbol`` when instrument identity is unresolved and
+        resolution attempts remain; ``get_market_data`` when identity is locked
+        but a price claim has no observed evidence and fetch attempts remain;
+        otherwise ``None`` (genuinely ambiguous, conflicting, or exhausted —
+        the loop must then ask the user or fail closed).
+
+        This is the deterministic half of #1081: recoverable missing evidence is
+        often obtainable through read-only tools, so a rejected draft should
+        drive the original task forward instead of stopping.
+        """
+        if self._recovery_rounds >= MAX_GROUNDING_RECOVERY_ROUNDS:
+            return None
+        if self._identity_required and self.identity_status == "unresolved":
+            if self._symbol_resolution_attempts < MAX_SYMBOL_RESOLUTION_ATTEMPTS:
+                return _RESOLVER_TOOL
+            return None
+        if self.identity_status == "locked" and any(
+            issue.get("code") in {"numeric_claim_unavailable", "unsourced_symbol_figures"}
+            for issue in validation.issues
+        ):
+            if self._price_evidence_attempts < MAX_PRICE_EVIDENCE_ATTEMPTS:
+                return "get_market_data"
+        return None
+
+    def record_recovery(self, action: str) -> None:
+        """Account one bounded recovery attempt against its budget."""
+        self._recovery_rounds += 1
+        if action == _RESOLVER_TOOL:
+            self._symbol_resolution_attempts += 1
+        elif action == "get_market_data":
+            self._price_evidence_attempts += 1
+
+    def recovery_prompt(self, action: str, validation: ValidationResult) -> str:
+        """Build an executable next-step message for one bounded recovery turn."""
+        if action == _RESOLVER_TOOL:
+            return (
+                "[GROUNDING RECOVERY] Instrument identity is not yet locked and is "
+                "recoverable with read-only tools. Call `search_symbol` for the candidate "
+                "name in a separate assistant tool-call turn, lock and reuse the exact "
+                "canonical symbol and venue it returns, then call `get_market_data`. "
+                "Do NOT ask the user to confirm or continue while this read-only recovery "
+                "remains available, and do NOT finalize yet."
+            )
+        if action == "get_market_data":
+            return (
+                "[GROUNDING RECOVERY] Identity is locked but price evidence is missing. "
+                "Call `get_market_data` for the locked canonical symbol and venue in a "
+                "separate tool-call turn and use its existing bounded provider fallback, "
+                "then regenerate and re-validate the final answer. Do NOT ask the user to "
+                "confirm or continue while this read-only recovery remains available, and "
+                "do NOT finalize yet."
+            )
+        return self.correction_prompt(validation)
 
     def safe_fallback(self) -> str:
         """Return a deterministic fail-closed answer after repeated rejection."""
@@ -1184,6 +1439,29 @@ class GroundingLedger:
                 "I rejected the previous draft because its prices conflicted with tool evidence. "
                 f"The verified observed OHLC range is: {joined}. "
                 "I will not invent an entry price without a visible derivation or refreshed evidence."
+            )
+        # No observed price evidence: distinguish "identity unresolved" from
+        # "the draft cited prices this session never observed". Reporting the
+        # identity message for the latter is misleading (the run may not even
+        # have touched the market tools).
+        issue_codes = {
+            code
+            for validation in self._validations
+            for code in (issue.get("code") for issue in validation.get("issues", []))
+        }
+        if issue_codes & {
+            "numeric_claim_unavailable", "numeric_claim_conflict", "unsourced_symbol_figures"
+        }:
+            if is_zh:
+                return (
+                    "我的回答被安全门槛拒绝:草稿引用了本会话未通过工具获取的价格数字,无法核验。"
+                    "请重新发起任务,让模型先调用行情工具获取数据,或要求它去掉这些价格引用后重试。"
+                )
+            return (
+                "My previous answer was rejected by the verification gate: it cited price "
+                "figures that this session never obtained through a tool, so they could not "
+                "be verified. Re-run the task and let the agent fetch the market data first, "
+                "or ask it to answer without the unverified prices."
             )
         if is_zh:
             return (
@@ -2231,7 +2509,9 @@ class GroundingLedger:
         masked = _LOCALIZED_DATE_RE.sub(" ", masked)
         masked = _DATE_RE.sub(" ", masked)
         masked = _SHORT_DATE_RE.sub(" ", masked)
+        masked = _DASH_DATE_RE.sub(" ", masked)
         masked = _PERCENT_RANGE_RE.sub(" ", masked)
+        masked = _ORDER_LEVEL_RE.sub(" ", masked)
         masked = _AGGREGATE_AMOUNT_RE.sub(" ", masked)
         masked = _LABELLED_SCORE_RE.sub(" ", masked)
         masked = _INDICATOR_VALUE_RE.sub(" ", masked)

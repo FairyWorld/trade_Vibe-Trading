@@ -17,6 +17,7 @@ from src.quantlib.crossvalidation import (
     Split,
     combinatorial_purged_splits,
     detect_boundary_leakage,
+    group_purged_kfold_splits,
     purged_kfold_splits,
     purged_walk_forward_splits,
 )
@@ -211,6 +212,27 @@ def test_combinatorial_holds_out_more_than_one_block_at_a_time():
         assert split.test.size >= 3 * (n // 6) - 3
 
 
+def test_combinatorial_gap_between_test_blocks_stays_trainable():
+    # Rows between two held-out blocks belong to neither test segment, so
+    # with zero-width labels and no embargo they must survive the purge.
+    n = 600
+    labels = np.arange(n)
+    saw_gap = False
+    for split in combinatorial_purged_splits(
+        n, labels, n_groups=6, n_test_groups=2, embargo_fraction=0.0
+    ):
+        test = np.sort(split.test)
+        blocks = np.split(test, np.flatnonzero(np.diff(test) > 1) + 1)
+        if len(blocks) < 2:
+            continue  # adjacent held-out groups merge into one segment
+        saw_gap = True
+        for left, right in zip(blocks, blocks[1:]):
+            gap = np.arange(left[-1] + 1, right[0])
+            assert gap.size > 0
+            assert np.isin(gap, split.train).all()
+    assert saw_gap
+
+
 # --- label end times as a pandas Series of timestamps ---
 
 
@@ -299,6 +321,16 @@ def test_mismatched_label_length_rejected():
         list(purged_kfold_splits(100, np.arange(50), n_folds=4))
 
 
+def test_excessive_embargo_removing_all_training_samples_rejected():
+    # A 2-fold split with 80% embargo removes all training samples
+    with pytest.raises(ValueError, match="removed all training samples"):
+        list(purged_kfold_splits(10, np.arange(10), n_folds=2, embargo_fraction=0.8))
+
+    groups = [1, 1, 2, 2]
+    with pytest.raises(ValueError, match="removed all training samples"):
+        list(group_purged_kfold_splits(groups, n_folds=2, embargo_fraction=0.8))
+
+
 @pytest.mark.parametrize("n_test_groups", [0, 6, 7])
 def test_bad_combinatorial_group_count_rejected(n_test_groups):
     with pytest.raises(ValueError, match="n_test_groups"):
@@ -311,3 +343,44 @@ def test_purge_counts_are_reported_not_hidden():
     for split in purged_kfold_splits(n, labels, n_folds=5):
         removed = n - split.train.size - split.test.size
         assert split.purged + split.embargoed == removed
+
+# --------------------------------------------------------------------------
+# group_purged_kfold_splits
+# --------------------------------------------------------------------------
+
+
+def test_group_purged_kfold_splits_prevents_cross_sectional_leakage():
+    # 10 assets x 100 dates = 1000 observations
+    n_dates = 100
+    n_assets = 10
+    dates = np.repeat(np.arange(n_dates), n_assets)
+
+    splits = list(group_purged_kfold_splits(dates, n_folds=5, embargo_fraction=0.05))
+    assert len(splits) == 5
+
+    for split in splits:
+        # 1. No shared row indices
+        assert len(np.intersect1d(split.train, split.test)) == 0
+
+        # 2. No shared dates between train and test
+        train_dates = set(dates[split.train])
+        test_dates = set(dates[split.test])
+        assert train_dates.intersection(test_dates) == set()
+
+        # 3. Exactly n_assets * number of test dates in test set
+        assert len(split.test) == len(test_dates) * n_assets
+
+        # 4. Embargo is applied to subsequent dates
+        test_max_date = max(test_dates)
+        embargo_expected_end = test_max_date + int(round(n_dates * 0.05))
+        for d in range(test_max_date + 1, min(n_dates, embargo_expected_end)):
+            assert d not in train_dates
+
+
+def test_group_purged_kfold_splits_input_validation():
+    with pytest.raises(ValueError, match="at least 2"):
+        list(group_purged_kfold_splits([1, 1, 2, 2], n_folds=1))
+    with pytest.raises(ValueError, match="cannot make 5 folds"):
+        list(group_purged_kfold_splits([1, 1, 2, 2], n_folds=5))
+    with pytest.raises(ValueError, match="groups array cannot be empty"):
+        list(group_purged_kfold_splits([], n_folds=2))

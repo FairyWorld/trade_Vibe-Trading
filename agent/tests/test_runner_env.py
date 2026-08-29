@@ -185,6 +185,44 @@ def test_prepare_sandbox_home_reexposes_only_loader_paths(tmp_path: Path) -> Non
     assert (vt / "cache").exists()
 
 
+def test_prepare_sandbox_home_copy_fallback_when_symlink_privileges_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Windows cannot always create symlinks; the copy fallback must still work.
+
+    On Windows, ``symlink_to`` can raise OSError 1314 (privilege not held) even
+    in an otherwise healthy environment. ``_prepare_sandbox_home`` must then copy
+    the loader-owned paths so the subprocess still sees them, and must still keep
+    persistent secrets/state out of the ephemeral home.
+    """
+    real_home = tmp_path / "home"
+    vt = real_home / ".vibe-trading"
+    (vt / "cache").mkdir(parents=True)
+    (vt / "data-bridge").mkdir(parents=True)
+    (vt / "qveris.json").write_text("{}", encoding="utf-8")
+
+    def _deny_symlink(*args, **kwargs):
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(Path, "symlink_to", _deny_symlink)
+
+    sandbox = _prepare_sandbox_home(real_home)
+    try:
+        dst_vt = sandbox / ".vibe-trading"
+        # Symlinks were impossible, yet the loader paths are still present...
+        assert (dst_vt / "cache").is_dir()
+        assert (dst_vt / "data-bridge").is_dir()
+        assert (dst_vt / "qveris.json").is_file()
+        # ...and the persistent secrets/state are still NOT re-exposed.
+        assert not (dst_vt / ".env").exists()
+        assert not (dst_vt / "memory").exists()
+    finally:
+        import shutil
+
+        shutil.rmtree(sandbox, ignore_errors=True)
+    assert not sandbox.exists()
+
+
 def test_prepare_sandbox_home_preseeds_mootdx_config(tmp_path: Path) -> None:
     sandbox = _prepare_sandbox_home(tmp_path)
     try:

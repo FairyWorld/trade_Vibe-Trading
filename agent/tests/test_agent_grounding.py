@@ -15,10 +15,13 @@ from src.agent.grounding import (
     _infer_currency,
     _infer_venue,
     _scan_symbols,
+    _symbol_from_csv_filename,
+    _timestamp_matches_claim_date,
 )
 from src.agent.loop import AgentLoop, _is_tool_success
 from src.agent.tools import BaseTool, ToolRegistry
 from src.agent.trace import TraceWriter
+from tests.message_roles_helpers import assert_system_messages_only_lead
 
 
 def _resolver_payload(
@@ -378,6 +381,68 @@ def test_provider_spellings_of_one_instrument_are_one_identity(
     )
 
     assert ledger.authorized_symbols == {locked}
+    assert authorization.allowed is True
+
+
+def test_binance_pair_resolution_authorizes_crypto_consumers(tmp_path: Path) -> None:
+    """Issue #1234: an exact connector pair must survive unrelated Yahoo hits."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Check the ETH-USDT orderbook and current price.",
+    )
+    before_resolution = ledger.authorized_symbols
+    resolver = ledger.authorize_tool_call(
+        "search_symbol",
+        {"query": "ETH-USDT"},
+        batch_authorized_symbols=before_resolution,
+        call_id="resolve-crypto",
+    )
+    assert resolver.allowed is True
+
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "ETH-USDT"},
+        result=json.dumps(
+            {
+                "ok": True,
+                "source": "symbol_search",
+                "data": {
+                    "query": "ETH-USDT",
+                    "count": 2,
+                    "sources": {"binance": "ok", "yahoo": "ok"},
+                    "candidates": [
+                        {
+                            "symbol": "ETH-USDT",
+                            "market": "crypto",
+                            "type": "cryptocurrency",
+                            "exchange": "BINANCE",
+                            "source": "binance",
+                        },
+                        {
+                            "symbol": "AETHUSDT-USD",
+                            "market": "global",
+                            "type": "cryptocurrency",
+                            "exchange": "CCC",
+                            "source": "yahoo",
+                        },
+                    ],
+                },
+            }
+        ),
+        call_id="resolve-crypto",
+        success=True,
+    )
+
+    authorization = ledger.authorize_tool_call(
+        "orderbook_depth",
+        {"symbol": "ETH-USDT", "exchange": "binance"},
+        batch_authorized_symbols=ledger.authorized_symbols,
+        batch_identity_status=ledger.identity_status,
+        call_id="crypto-book",
+    )
+
+    assert ledger.identity_status == "locked"
+    assert ledger.authorized_symbols == {"ETH-USDT"}
     assert authorization.allowed is True
 
 
@@ -745,6 +810,85 @@ def test_run_dir_ohlc_csv_tsx_filename_maps_symbol(tmp_path: Path) -> None:
     assert good.valid is True, good.issues
 
 
+def test_weekday_suffixed_claim_dates_match_evidence() -> None:
+    """Yearless dates with weekday/intraday annotations still match evidence.
+
+    Reports write a trading day as ``08-10(一)``, ``08-10(周一)盘中`` or
+    ``08-10盘中`` rather than bare ``08-10``. Before the prefix matcher, such
+    a date cell matched no evidence row and every correct price in the row
+    was rejected as ``numeric_claim_unavailable`` (#1015 session regression).
+    """
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "08-10(一)") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "08-10(周一)盘中") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "08-10盘中") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "08-10") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "2026-08-10") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "2026-08-10(一)") is True
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "08-11") is False
+    assert _timestamp_matches_claim_date("2026-08-10T00:00:00", "no-date") is False
+
+
+def test_run_dir_ohlc_csv_us_filename_maps_symbol(tmp_path: Path) -> None:
+    """INTC_US.csv maps to INTC.US and grounds weekday-suffixed date rows.
+
+    Regression for a real session: the agent wrote ``data/raw/INTC_US.csv``
+    and drafted the report in the file's own date format (``08-10(一)``).
+    The filename used to map to None (no ``_US`` rule), so the CSV was never
+    ingested; combined with the weekday-suffixed date cell, every correct
+    price in the draft was rejected and the run surrendered after three
+    failed drafts without updating the report.
+    """
+    raw = tmp_path / "data" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "INTC_US.csv").write_text(
+        "Date,Open,High,Low,Close,Adj Close,Volume\n"
+        "2026-08-07,102.33,103.66,98.03,101.65,101.65,76760600\n"
+        "2026-08-10,98.26,100.03,96.30,97.52,97.52,101153400\n",
+        encoding="utf-8",
+    )
+
+    assert _symbol_from_csv_filename("INTC_US") == "INTC.US"
+
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="please update intel-tech-trend-6-months.md",
+    )
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "INTC"},
+        result=json.dumps({
+            "ok": True,
+            "data": {
+                "candidates": [
+                    {"symbol": "INTC.US", "name": "Intel Corporation", "market": "us",
+                     "type": "equity", "exchange": "NMS", "source": "yahoo"},
+                ]
+            },
+        }),
+        call_id="lock1",
+        success=True,
+    )
+
+    table = (
+        "INTC.US（yfinance，USD）日线如下：\n"
+        "| 日期 | 开盘 | 最高 | 最低 | 收盘 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 08-07(五) | 102.33 | 103.66 | 98.03 | 101.65 |\n"
+        "| 08-10(一) | 98.26 | 100.03 | 96.30 | 97.52 |\n"
+    )
+    result = ledger.validate_final_answer(table)
+    assert result.valid is True, result.issues
+
+    # The date is masked in prose, but a fabricated price is still caught.
+    fabricated = ledger.validate_final_answer(
+        "INTC.US（yfinance，USD）08-10(一) 开盘价 88.88，收盘价 97.52，数据源 yahoo。"
+    )
+    assert fabricated.valid is False
+    assert any(
+        issue["code"] == "numeric_claim_conflict" for issue in fabricated.issues
+    )
+
+
 def test_run_dir_ohlc_csv_stray_symbol_is_ignored(tmp_path: Path) -> None:
     """A CSV for a symbol the run never handled does not mint identity."""
     raw = tmp_path / "data" / "raw"
@@ -860,6 +1004,7 @@ class _CorrectingLLM:
                 )
             ),
         ]
+        self.messages_history: list[list[dict[str, Any]]] = []
 
     def stream_chat(
         self,
@@ -867,8 +1012,11 @@ class _CorrectingLLM:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _Response:
+        self.messages_history.append(list(messages))
         response = self.responses.pop(0)
         if response.content and on_text_chunk:
             on_text_chunk(response.content)
@@ -888,9 +1036,10 @@ def test_agent_loop_rejects_then_corrects_ungrounded_final_answer(
     registry.register(resolver)
     registry.register(market)
     events: list[tuple[str, dict[str, Any]]] = []
+    llm = _CorrectingLLM()
     agent = AgentLoop(
         registry=registry,
-        llm=_CorrectingLLM(),
+        llm=llm,
         max_iterations=4,
         event_callback=lambda event, data: events.append((event, data)),
     )
@@ -904,6 +1053,8 @@ def test_agent_loop_rejects_then_corrects_ungrounded_final_answer(
     assert "1.137" in result["content"]
     assert "0.881" not in result["content"]
     assert market.calls == 1
+    # The correction nudge must not be a mid-conversation system message.
+    assert_system_messages_only_lead(llm.messages_history)
     streamed = "".join(
         data.get("delta", "") for event, data in events if event == "text_delta"
     )
@@ -1108,6 +1259,36 @@ def test_price_validation_ignores_short_dates_and_percent_ranges(
         "000543.SZ 8/5 收盘价 8.20 CNY（source: tencent）",
         "000543.SZ 现价 8.20 CNY，距阻力位仅 1–2%（source: tencent）",
         "000543.SZ 现价 8.20 CNY，距阻力位仅 1-2%（source: tencent）",
+    ):
+        result = ledger.validate_final_answer(draft)
+        assert result.valid is True, (draft, result.issues)
+
+
+def test_numbers_without_dates_or_percent_masks_cjk_glued_iso_dates() -> None:
+    """An ISO date running into CJK text is one date, not three prices (#1122).
+
+    ``\b`` is Unicode-aware, so CJK letters count as word characters and
+    ``(2026-07-14最低)`` had no boundary after ``14`` -- the date survived and
+    contributed 2026/7/14 as candidate prices. ``re.ASCII`` restores the byte
+    boundary so the whole date masks while a genuine quote beside it stays.
+    """
+    assert (
+        GroundingLedger._numbers_without_dates_or_percent("若跌破观测支撑位0.980 CNY (2026-07-14最低)")
+        == []
+    )
+    assert (
+        GroundingLedger._numbers_without_dates_or_percent("收盘价 8.20 CNY 自2026-07-14以来最低")
+        == [8.2]
+    )
+
+
+def test_iso_date_running_into_cjk_text_is_still_masked(tmp_path: Path) -> None:
+    """The end-to-end gate no longer rejects a correct report over a glued date (#1122)."""
+    ledger = _screened_ledger(tmp_path)
+
+    for draft in (
+        "000543.SZ 收盘价 8.20 CNY（2026-07-14最低）（source: tencent）",
+        "000543.SZ 收盘价 8.20 CNY 自2026-07-14以来最低（source: tencent）",
     ):
         result = ledger.validate_final_answer(draft)
         assert result.valid is True, (draft, result.issues)
@@ -2124,3 +2305,169 @@ def test_in_text_decimal_survives_list_marker_mask(
     ):
         result = ledger.validate_final_answer(draft)
         assert result.valid is True, (draft, result.issues)
+
+
+def test_order_level_prices_are_not_observed_quotes(tmp_path: Path) -> None:
+    """GTC order limits (100 @ $3.50) are prospective, not observed prices.
+
+    Regression for the RXRX run: the draft "两档 GTC (100 @ $3.50 / 100 @ $4.00)
+    均未触发 (周高 $3.42 < $3.50)" was rejected with numeric_claim_conflict for
+    100, 3.5 and 4.0 against the observed OHLC range. Order levels are levels,
+    like targets/stops, and share counts are quantities - neither is a claim
+    about an observed quote.
+    """
+    raw = tmp_path / "data" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "RXRX_US.csv").write_text(
+        "Date,Open,High,Low,Close\n"
+        "2026-08-07,3.25,3.26,3.18,3.20\n"
+        "2026-08-08,3.10,3.42,3.05,3.35\n",
+        encoding="utf-8",
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="请分析 RXRX.US 并更新周报",
+    )
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "RXRX"},
+        result=json.dumps({
+            "ok": True,
+            "data": {
+                "candidates": [
+                    {"symbol": "RXRX.US", "name": "Recursion Pharmaceuticals", "market": "us",
+                     "type": "equity", "exchange": "NMS", "source": "yahoo"},
+                ]
+            },
+        }),
+        call_id="lock1",
+        success=True,
+    )
+
+    answer = (
+        "RXRX.US（yahoo，USD）本周高 $3.42。订单: 两档 GTC (100 @ $3.50 / 100 @ $4.00) "
+        "均未触发 (周高 $3.42 < $3.50) — 价格推断未成交。"
+    )
+    result = ledger.validate_final_answer(answer)
+    assert result.valid is True, result.issues
+
+    # A genuinely fabricated close is still rejected.
+    fabricated = ledger.validate_final_answer(
+        "RXRX.US（yahoo，USD）本周高 $3.42。另: 收盘 2.50 已确认。"
+    )
+    assert fabricated.valid is False
+    assert any(
+        issue["code"] == "numeric_claim_conflict" for issue in fabricated.issues
+    )
+
+
+def test_dash_form_trading_day_is_a_date_but_a_price_range_is_not() -> None:
+    """A report writes the day as "08-10(一)"; a target still writes "10-20 元".
+
+    The dash carries both meanings, so the mask splits them: a zero-padded
+    month reads as a date on its own, October through December need a weekday
+    or session marker, and a range with neither stays checkable.
+    """
+    extract = GroundingLedger._numbers_without_dates_or_percent
+
+    assert extract("08-10(一) 收盘 8.20 CNY") == [8.2]
+    assert extract("08-10盘中最低 8.20 CNY") == [8.2]
+    assert extract("08-10 close 8.20 USD") == [8.2]
+    assert extract("10-20(周一)盘中 8.20 CNY") == [8.2]
+
+    # No date marker and no zero-padded month: an ordinary quoted range, and
+    # masking it would stop checking a claim the ledger exists to check.
+    assert extract("区间 8-10 元") == [8.0, 10.0]
+    assert extract("跌 12-25 元") == [12.0, 25.0]
+
+
+def test_a_level_stated_as_a_range_masks_both_bounds(tmp_path: Path) -> None:
+    """Masking only the lower bound left a negative upper bound behind.
+
+    The separator touches the second number, so "目标价 10-20 元" used to
+    reduce to "-20" — and a negative price is outside every OHLC window, which
+    made a correct draft impossible to pass rather than merely unchecked.
+    """
+    extract = GroundingLedger._numbers_without_dates_or_percent
+
+    for draft in ("目标价 10-20 元", "支撑位 8-10 元", "阻力位 12.0~13.5", "52周高 15.0-16.0"):
+        assert extract(draft) == [], draft
+
+    # A single-value level is unchanged, and an observed quote beside a ranged
+    # level is still extracted and checked.
+    assert extract("止损位 7.5 元") == []
+    assert extract("目标价 10-20 元，现价 8.20 CNY") == [8.2]
+
+    ledger = _screened_ledger(tmp_path)
+    result = ledger.validate_final_answer(
+        "000543.SZ 收盘价 8.20 CNY，目标价 10-20 元（source: tencent）"
+    )
+    assert result.valid is True, result.issues
+
+
+def test_an_order_line_is_an_instruction_not_an_observation(tmp_path: Path) -> None:
+    """"100 @ $3.50" states where a limit sits; 100 was never a price at all.
+
+    A GTC summary in a weekly update was read as two observed quotes and
+    rejected against the session's range, which is the same category error the
+    target/stop masks already prevent.
+    """
+    extract = GroundingLedger._numbers_without_dates_or_percent
+
+    for draft in (
+        "GTC 100 @ $3.50",
+        "buy 100 @ $3.50 GTC",
+        "挂单 100 股 @ 4.00",
+        "限价单 100 @ 3.50",
+        "委托价 3.50",
+    ):
+        assert extract(draft) == [], draft
+
+    # 买入价/卖出价 stay OUT of the label set: in running prose they name the
+    # price a report says it observed, and masking them let an ungrounded
+    # quote through the gate.
+    assert extract("买入价 0.881") == [0.881]
+
+    # There is no bare "@ <price>" branch either. Dates are masked before this
+    # runs, so an observed close written "2026-08-10 @ 8.20" would reach the
+    # order mask as "@ 8.20" and stop being checked at all.
+    assert extract("收盘 2026-08-10 @ 8.20") == [8.2]
+
+    # An observed quote standing beside an order line is still checked, and a
+    # bare handle carries no price to mask.
+    assert extract("现价 8.20 CNY，挂单 100 @ 8.50") == [8.2]
+    assert extract("联系 @user 获取") == []
+
+    ledger = _screened_ledger(tmp_path)
+    result = ledger.validate_final_answer(
+        "000543.SZ 收盘价 8.20 CNY，挂单 100 股 @ 12.00（source: tencent）"
+    )
+    assert result.valid is True, result.issues
+
+
+def test_a_report_style_date_cell_still_matches_its_evidence_row() -> None:
+    """"08-10(一)" and "08-10盘中" are the same trading day as "08-10".
+
+    A weekday or session suffix made the cell match no evidence row, so every
+    price in that row was reported numeric_claim_unavailable even though the
+    run had fetched the bar.
+    """
+    from src.agent.grounding import _timestamp_matches_claim_date
+
+    stamp = "2026-08-10T15:00:00Z"
+    for claim in ("08-10", "8-10", "08-10(一)", "08-10(周一)", "08-10(周一)盘中", "08-10盘中", "08-10收盘"):
+        assert _timestamp_matches_claim_date(stamp, claim) is True, claim
+
+    # The suffix is decoration, not a wildcard — a different day still misses.
+    assert _timestamp_matches_claim_date(stamp, "08-11(一)") is False
+
+
+def test_a_us_csv_stem_resolves_to_its_venue_suffix() -> None:
+    """``INTC_US.csv`` is ``INTC.US``; without the row it was no evidence at all."""
+    from src.agent.grounding import _symbol_from_csv_filename
+
+    assert _symbol_from_csv_filename("INTC_US") == "INTC.US"
+    assert _symbol_from_csv_filename("BYN_V") == "BYN.V"
+    assert _symbol_from_csv_filename("GC_F") == "GC=F"
+    # A bare name has no venue suffix and must stay unresolvable.
+    assert _symbol_from_csv_filename("AAPL") is None

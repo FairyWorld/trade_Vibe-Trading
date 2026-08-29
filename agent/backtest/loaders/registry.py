@@ -54,6 +54,7 @@ VALID_SOURCES: set[str] = {
     "pykrx",
     "longbridge",
     "mt5",
+    "tickerall",
     "local",
     "auto",
 }
@@ -75,6 +76,10 @@ def _ensure_registered() -> None:
     Loaders whose dependencies are missing (e.g. ``akshare`` not installed)
     are silently skipped.
     """
+    # Re-check env overrides even when already registered — a subprocess may
+    # have loaded ~/.vibe-trading/.env (or synced os.environ) after this
+    # module's import-time refresh ran. Must precede the early return.
+    refresh_source_order_overrides()
     global _registered
     if _registered:
         return
@@ -104,6 +109,7 @@ def _ensure_registered() -> None:
         "backtest.loaders.pykrx_loader",
         "backtest.loaders.longbridge",
         "backtest.loaders.mt5_loader",
+        "backtest.loaders.tickerall_loader",
         "backtest.loaders.local_loader",
     ]
     import importlib
@@ -121,7 +127,8 @@ def _ensure_registered() -> None:
 # unavailable ``local`` request can degrade into an unrelated network source.
 # An explicit ``local`` request that is unavailable is a config problem the user
 # must see, not something to paper over with a Yahoo/Tencent fetch.
-_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local", "qveris"})  # QVERIS-INTEGRATION
+# ``tickerall`` joins for the same reason (explicit-only, the user's own broker key).
+_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local", "qveris", "tickerall"})  # QVERIS-INTEGRATION
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +151,9 @@ FALLBACK_CHAINS: dict[str, list[str]] = {
     "kr_equity":   ["pykrx", "yahoo", "yfinance", "local"],
     # TSX (.TO) / TSX Venture (.V): direct Yahoo first, SDK fallback second.
     "ca_equity":   ["yahoo", "yfinance", "local"],
+    # Vietnam (.VN): Yahoo lists HOSE only — HNX and UPCOM are unsupported,
+    # so those two are reachable only through the user's local files.
+    "vietnam_equity": ["yahoo", "yfinance", "local"],
     # OKX first (native), then dedicated Binance, then generic CCXT / Yahoo.
     "crypto":    ["okx", "binance", "ccxt", "yfinance", "local"],
     "futures":   ["tushare", "akshare", "local"],
@@ -153,6 +163,128 @@ FALLBACK_CHAINS: dict[str, list[str]] = {
     # broker feed); otherwise it reports unavailable and the chain proceeds.
     "forex":     ["mt5", "akshare", "yfinance", "local"],
 }
+
+
+# ---------------------------------------------------------------------------
+# Source-order overrides: per-market env-configurable chain priority
+# ---------------------------------------------------------------------------
+
+# Users can reprioritize a market's chain via one env var per market
+# (persisted to ~/.vibe-trading/.env by the Settings page's "source
+# priority" card):
+#     MARKET_DATA_ORDER_A_SHARE=tushare,tencent,mootdx,...
+# The value must be a permutation of the market's default chain —
+# reordering is allowed, adding/dropping sources is not. Invalid values
+# warn and keep the default chain, so a typo can never silently strip a
+# market of its sources.
+_SOURCE_ORDER_ENV_PREFIX = "MARKET_DATA_ORDER_"
+
+# Snapshot of the chains as written above. refresh_source_order_overrides()
+# restores from here; entries must never leak into FALLBACK_CHAINS by
+# aliasing (always copy on restore), or a restore would mutate the snapshot.
+_DEFAULT_CHAINS: dict[str, list[str]] = {
+    market: chain[:] for market, chain in FALLBACK_CHAINS.items()
+}
+
+# market -> override currently in effect. Populated only by
+# refresh_source_order_overrides(); absent key = default chain in effect.
+_ACTIVE_SOURCE_ORDER_OVERRIDES: dict[str, list[str]] = {}
+
+# Env values refresh_source_order_overrides() last saw. When unchanged the
+# refresh is a no-op — override-free environments never touch FALLBACK_CHAINS,
+# so tests that patch.dict the chains directly stay unaffected.
+_LAST_ORDER_ENV_SNAPSHOT: dict[str, str] | None = None
+
+
+def source_order_env_var(market: str) -> str:
+    """Return the env var name overriding ``market``'s source order.
+
+    ``"a_share"`` -> ``"MARKET_DATA_ORDER_A_SHARE"``.
+    """
+    return _SOURCE_ORDER_ENV_PREFIX + market.upper()
+
+
+def parse_source_order(raw: str) -> list[str]:
+    """Parse a comma-separated source order string.
+
+    Tokens are stripped, lowercased, and empty ones dropped, so
+    ``" TUSHARE, tencent ,, "`` parses to ``["tushare", "tencent"]``.
+    Validating against the market's default chain is a separate step
+    (:func:`is_valid_source_order`).
+    """
+    return [token.strip().lower() for token in raw.split(",") if token.strip()]
+
+
+def is_valid_source_order(market: str, order: list[str]) -> bool:
+    """True when ``order`` is a permutation of ``market``'s default chain.
+
+    Multiset equality — every default member exactly once, nothing extra —
+    so reordering passes while adding, dropping, or duplicating a source
+    fails. Unknown markets are never valid.
+    """
+    default = _DEFAULT_CHAINS.get(market)
+    if default is None:
+        return False
+    return sorted(order) == sorted(default)
+
+
+def get_default_source_order(market: str) -> list[str]:
+    """Return a copy of ``market``'s default chain (empty if unknown)."""
+    return _DEFAULT_CHAINS.get(market, [])[:]
+
+
+def get_source_order_override(market: str) -> list[str] | None:
+    """Return the active env-configured order for ``market``, or ``None``."""
+    override = _ACTIVE_SOURCE_ORDER_OVERRIDES.get(market)
+    return override[:] if override is not None else None
+
+
+def refresh_source_order_overrides() -> None:
+    """Apply ``MARKET_DATA_ORDER_*`` env values onto :data:`FALLBACK_CHAINS`.
+
+    Snapshot-gated: when the relevant env vars are unchanged since the last
+    call, return immediately — an environment with no overrides costs
+    nothing and never reassigns chains. On change, each market's chain is
+    reassigned **in place** (``FALLBACK_CHAINS[market] = ...``): the dict
+    keeps its identity, so both ``from ... import FALLBACK_CHAINS`` and
+    attribute-access consumers see the new order. An empty/cleared var
+    restores the default chain.
+    """
+    global _LAST_ORDER_ENV_SNAPSHOT
+    # Config-layer read (ci_env_var_gate: no raw os.getenv outside src/config/).
+    # get_env_value passes through to os.getenv un-cached, so hot-apply still
+    # only needs the os.environ sync the Settings PUT performs. Imported here,
+    # not at module top, matching the other loaders' accessor usage.
+    from src.config.accessor import get_env_value
+
+    snapshot = {
+        source_order_env_var(market): get_env_value(source_order_env_var(market), "")
+        for market in _DEFAULT_CHAINS
+    }
+    if snapshot == _LAST_ORDER_ENV_SNAPSHOT:
+        return
+    _LAST_ORDER_ENV_SNAPSHOT = snapshot
+
+    for market, default in _DEFAULT_CHAINS.items():
+        raw = snapshot[source_order_env_var(market)]
+        order = parse_source_order(raw) if raw else []
+        if order and is_valid_source_order(market, order):
+            FALLBACK_CHAINS[market] = order[:]
+            _ACTIVE_SOURCE_ORDER_OVERRIDES[market] = order[:]
+            continue
+        if order:  # non-empty but invalid — warn, keep default order
+            logger.warning(
+                "Ignoring invalid %s=%r: value must be a permutation of the"
+                " default chain %s; keeping default order",
+                source_order_env_var(market), raw, default,
+            )
+        FALLBACK_CHAINS[market] = default[:]
+        _ACTIVE_SOURCE_ORDER_OVERRIDES.pop(market, None)
+
+
+# Import-time refresh: picks up overrides present in the process env before
+# any caller touches the chains (subprocess/CLI entry paths).
+refresh_source_order_overrides()
 
 
 def resolve_loader(market: str) -> Any:
@@ -224,11 +356,15 @@ def get_loader_cls_with_fallback(source: str) -> Type[Any]:
     # auto-resolver, so falling back through it would fetch network data the
     # user never asked for and mask a Data Bridge config problem. Fail loudly.
     if source in _NO_NETWORK_FALLBACK_SOURCES:
+        hint = {
+            "local": "Check your Data Bridge config "
+                     "(~/.vibe-trading/data-bridge/config.yaml) — it must exist and "
+                     "list at least one source.",
+            "tickerall": "Set TICKERALL_API_KEY and TICKERALL_ACCOUNT_ID.",
+        }.get(source, "")
         raise NoAvailableSourceError(
             f"Data source '{source}' is unavailable and does not fall back to a "
-            f"network source. Check your local Data Bridge config "
-            f"(~/.vibe-trading/data-bridge/config.yaml) — it must exist and list "
-            f"at least one source."
+            f"network source. {hint}".rstrip()
         )
 
     # Source unavailable — try same-market fallback

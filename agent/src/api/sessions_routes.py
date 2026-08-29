@@ -188,6 +188,10 @@ def _get_goal_store():
 
 _PROPOSAL_TOOL_NAME = "propose_mandate_profiles"
 _PROPOSAL_ID_RE = re.compile(r'"proposal_id"\s*:\s*"(mp_[0-9a-f]{32})"')
+_SCHEDULED_PROPOSAL_TOOL_NAME = "scheduled_research"
+_SCHEDULED_PROPOSAL_ID_RE = re.compile(
+    r'"proposal_id"\s*:\s*"(srp_[0-9a-f]{32})"'
+)
 
 
 def _load_full_proposal(proposal_id: str) -> Optional[Dict[str, Any]]:
@@ -229,6 +233,32 @@ def _mandate_proposal_frame_from_tool_result(event: Any) -> Optional[str]:
         session_id=getattr(event, "session_id", "") or "",
     )
     return frame.to_sse()
+
+
+def _scheduled_proposal_frame_from_tool_result(event: Any) -> Optional[str]:
+    """Build a deterministic scheduled-research confirmation SSE frame."""
+    data = getattr(event, "data", None)
+    if getattr(event, "event_type", None) != "tool_result" or not isinstance(data, dict):
+        return None
+    if data.get("tool") != _SCHEDULED_PROPOSAL_TOOL_NAME or data.get("status") != "ok":
+        return None
+    match = _SCHEDULED_PROPOSAL_ID_RE.search(str(data.get("preview") or ""))
+    if not match:
+        return None
+    try:
+        from src.scheduled_research.proposals import load_proposal
+
+        proposal = load_proposal(match.group(1))
+    except Exception:  # pragma: no cover - relay must never break the stream
+        logger.debug("scheduled proposal reload failed", exc_info=True)
+        return None
+    from src.session.events import SSEEvent
+
+    return SSEEvent(
+        event_type="scheduled_research.proposal",
+        data=proposal,
+        session_id=getattr(event, "session_id", "") or "",
+    ).to_sse()
 
 
 _LIVE_ACTION_ID_RE = re.compile(r'"audit_id"\s*:\s*"(la_[0-9a-zA-Z]+)"')
@@ -674,15 +704,19 @@ def register_sessions_routes(app: FastAPI) -> None:
         def _generate() -> str:
             from src.providers.chat import ChatLLM
 
-            response = ChatLLM().chat([{"role": "user", "content": prompt}], timeout=30)
-            return (getattr(response, "content", "") or "").strip()
+            llm = ChatLLM()
+            try:
+                response = llm.chat([{"role": "user", "content": prompt}], timeout=30)
+                return (getattr(response, "content", "") or "").strip()
+            finally:
+                llm.close()
 
         try:
             raw = await asyncio.to_thread(_generate)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"title generation failed: {exc}")
 
-        title = raw.splitlines()[0].strip().strip("\"'“”「」『』").strip()
+        title = raw.splitlines()[0].strip().strip("\"'“”「」『』").strip() if raw else ""
         chars = list(title)
         if len(chars) > 40:
             title = "".join(chars[:40])
@@ -786,6 +820,9 @@ def register_sessions_routes(app: FastAPI) -> None:
                 relayed = _mandate_proposal_frame_from_tool_result(event)
                 if relayed is not None:
                     yield relayed
+                scheduled_relay = _scheduled_proposal_frame_from_tool_result(event)
+                if scheduled_relay is not None:
+                    yield scheduled_relay
                 live_action = _live_action_frame_from_tool_result(event)
                 if live_action is not None:
                     yield live_action

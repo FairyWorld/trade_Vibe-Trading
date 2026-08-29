@@ -91,6 +91,18 @@ def test_spark_capabilities_use_generic_openai_path() -> None:
     assert get_provider_capabilities("iflytek", "4.0Ultra") is spark
 
 
+def test_novita_capabilities_use_generic_openai_path() -> None:
+    """Novita AI rides the plain OpenAI-compatible path with no capability flags."""
+    novita = get_provider_capabilities("novita", "moonshotai/kimi-k3")
+
+    assert novita.name == "novita"
+    assert novita.api_key_env == "NOVITA_API_KEY"
+    assert novita.base_url_env == "NOVITA_BASE_URL"
+    assert novita.capture_reasoning is False
+    assert novita.send_reasoning_content is False
+    assert novita.openrouter_reasoning_body is False
+
+
 def test_reasoning_effort_extra_body_is_openrouter_only() -> None:
     """LANGCHAIN_REASONING_EFFORT should not leak into official DeepSeek payloads."""
     import src.providers.llm as llm_mod

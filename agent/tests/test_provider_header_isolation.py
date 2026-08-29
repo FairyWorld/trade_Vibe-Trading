@@ -240,3 +240,127 @@ def test_provider_doctor_reports_header_safety_without_values() -> None:
     encoded = json.dumps(diagnostics, ensure_ascii=False)
     assert "sk-or-secret-value" not in encoded
     assert "private-à" not in encoded
+
+
+def _sse_usage_body(text: str, output_tokens: int) -> bytes:
+    """SSE payload whose final chunk carries real usage (stream include_usage)."""
+    text_chunk = {
+        "id": "chatcmpl-usage-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "gpt-usage-test",
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+    }
+    usage_chunk = {
+        "id": "chatcmpl-usage-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "gpt-usage-test",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": output_tokens,
+            "total_tokens": 28 + output_tokens,
+        },
+    }
+    return (f"data: {json.dumps(text_chunk)}\n\ndata: {json.dumps(usage_chunk)}\n\ndata: [DONE]\n\n").encode("utf-8")
+
+
+@pytest.mark.skipif(
+    ChatOpenAIWithReasoning is None,
+    reason="langchain-openai is not installed",
+)
+def test_stream_requests_usage_and_forwards_real_counts() -> None:
+    """stream_usage=True must put stream_options on the wire and let the
+    accumulated response carry the provider's real token counts (#1224)."""
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode("utf-8")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_usage_body("ok", 241),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        llm = ChatOpenAIWithReasoning(
+            model="gpt-usage-test",
+            api_key="sk-test",
+            base_url="https://api.openai.invalid/v1",
+            stream_usage=True,
+            http_client=client,
+            vibe_provider="openai",
+            vibe_api_key="sk-test",
+        )
+        accumulated = None
+        for chunk in llm.stream("hello"):
+            accumulated = chunk if accumulated is None else accumulated + chunk
+
+    assert '"stream_options":{"include_usage":true}' in str(seen["body"])
+    usage = getattr(accumulated, "usage_metadata", None)
+    assert usage is not None
+    assert usage["input_tokens"] == 28
+    assert usage["output_tokens"] == 241
+
+
+@pytest.mark.skipif(
+    ChatOpenAIWithReasoning is None,
+    reason="langchain-openai is not installed",
+)
+def test_stream_usage_rejection_self_heals_and_is_remembered() -> None:
+    """An endpoint that 400s on stream_options gets one stateless retry, and
+    later calls skip the doomed attempt entirely."""
+    import src.providers.llm as llm_mod
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode("utf-8")
+        calls.append(body)
+        if '"stream_options"' in body:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "Unknown parameter: 'stream_options' is unsupported"}},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_usage_body("ok", 3),
+        )
+
+    model = "gpt-usage-reject-test"
+    llm_mod._STREAM_USAGE_UNSUPPORTED.discard(model)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        llm = ChatOpenAIWithReasoning(
+            model=model,
+            api_key="sk-test",
+            base_url="https://api.openai.invalid/v1",
+            stream_usage=True,
+            http_client=client,
+            vibe_provider="openai",
+            vibe_api_key="sk-test",
+        )
+        first = "".join(chunk.content for chunk in llm.stream("hello"))
+        second = "".join(chunk.content for chunk in llm.stream("hello again"))
+
+    assert first == "ok"
+    assert second == "ok"
+    # First call: one rejected attempt plus the stateless retry. Second call:
+    # straight to no-usage, no wasted 400.
+    assert len(calls) == 3
+    assert '"stream_options"' in calls[0]
+    assert '"stream_options"' not in calls[1]
+    assert '"stream_options"' not in calls[2]
+    llm_mod._STREAM_USAGE_UNSUPPORTED.discard(model)
+
+
+def test_stream_usage_unsupported_error_detection() -> None:
+    import src.providers.llm as llm_mod
+
+    assert llm_mod._is_stream_usage_unsupported_error(ValueError("Unknown parameter: 'stream_options' is unsupported"))
+    assert llm_mod._is_stream_usage_unsupported_error(
+        ValueError("include_usage is not a valid field for this endpoint")
+    )
+    assert not llm_mod._is_stream_usage_unsupported_error(ValueError("model overloaded, retry later"))
+    assert not llm_mod._is_stream_usage_unsupported_error(ValueError("temperature is unsupported"))

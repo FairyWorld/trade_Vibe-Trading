@@ -10,7 +10,11 @@ import {
   type StoredAgentMessage,
 } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LLMSettings } from "@/lib/api";
+import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type ScheduledResearchProposal, type LiveAction, type LiveHalted, type LLMSettings } from "@/lib/api";
+import {
+  extractUploadedAttachments,
+  prependUploadedAttachments,
+} from "@/lib/attachments";
 import { isReportWorthyRun } from "@/lib/runReports";
 import type { AgentMessage, SwarmRunStatus, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
@@ -21,6 +25,7 @@ import { ThinkingTimeline } from "@/components/chat/ThinkingTimeline";
 import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ActivityLine } from "@/components/chat/ActivityLine";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
+import { ScheduledResearchProposalCard } from "@/components/chat/ScheduledResearchProposalCard";
 import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
 import {
   Composer,
@@ -118,14 +123,11 @@ function toDisplayPrompt(content: string): {
   content: string;
   meta?: AgentMessageMeta;
 } {
-  let display = content;
+  const extractedAttachments = extractUploadedAttachments(content);
+  let display = extractedAttachments.content;
   const meta: AgentMessageMeta = { requestText: content };
-  const attachmentMatch = display.match(
-    /^\[Uploaded file: (.+), path: [^\n]*\]\n\n/,
-  );
-  if (attachmentMatch) {
-    meta.attachment = { filename: attachmentMatch[1] };
-    display = display.slice(attachmentMatch[0].length);
+  if (extractedAttachments.filenames.length > 0) {
+    meta.attachments = extractedAttachments.filenames.map((filename) => ({ filename }));
   }
   if (display.startsWith(SWARM_PROMPT_PREFIX)) {
     meta.swarmMode = true;
@@ -168,7 +170,12 @@ interface LiveActionItem {
   timestamp: number;
   action: LiveAction;
 }
-type LiveItem = ProposalItem | LiveActionItem;
+interface ScheduledProposalItem {
+  kind: "scheduled_proposal";
+  timestamp: number;
+  proposal: ScheduledResearchProposal;
+}
+type LiveItem = ProposalItem | ScheduledProposalItem | LiveActionItem;
 
 function isCriterionStatusMet(status: string): boolean {
   return !["", "pending", "open", "unsatisfied"].includes(status.toLowerCase());
@@ -1102,6 +1109,17 @@ export function Agent() {
         scrollToBottom();
       },
 
+      "scheduled_research.proposal": (d) => {
+        touch();
+        const proposal = d as unknown as ScheduledResearchProposal;
+        if (!proposal.proposal_id || !proposal.job) return;
+        setLiveItems((items) => [
+          ...items,
+          { kind: "scheduled_proposal", timestamp: Date.now(), proposal },
+        ]);
+        scrollToBottom();
+      },
+
       "live.halted": (d) => {
         touch();
         const halted = d as unknown as LiveHalted;
@@ -1264,9 +1282,9 @@ export function Agent() {
 
   const runPrompt = useCallback(async (
     prompt: string,
-    attachment: ComposerAttachment | null = null,
+    attachments: ComposerAttachment[] = [],
   ) => {
-    if (!prompt.trim() || status === "streaming") return;
+    if ((!prompt.trim() && attachments.length === 0) || status === "streaming") return;
     clearStreamingView();
 
     if (goalComposerActive) {
@@ -1315,9 +1333,9 @@ export function Agent() {
       finalPrompt = `${SWARM_PROMPT_PREFIX}${prompt}`;
     }
 
-    if (attachment) {
-      messageMeta.attachment = { filename: attachment.filename };
-      finalPrompt = `[Uploaded file: ${attachment.filename}, path: ${attachment.filePath}]\n\n${finalPrompt}`;
+    if (attachments.length > 0) {
+      messageMeta.attachments = attachments.map(({ filename }) => ({ filename }));
+      finalPrompt = prependUploadedAttachments(finalPrompt, attachments);
     }
     messageMeta.requestText = finalPrompt;
     act().addMessage({
@@ -1334,7 +1352,9 @@ export function Agent() {
     try {
       let sid = act().sessionId;
       if (!sid) {
-        const session = await api.createSession(prompt.slice(0, 50));
+        const sessionTitle = prompt.trim()
+          || attachments.map(({ filename }) => filename).join(", ");
+        const session = await api.createSession(sessionTitle.slice(0, 50));
         sid = session.session_id;
         act().setSessionId(sid);
         setSearchParams({ session: sid }, { replace: true });
@@ -1571,7 +1591,9 @@ export function Agent() {
     for (const item of liveItems) {
       const key = item.kind === "proposal"
         ? `${sessionId ?? "draft"}_lp_${item.proposal.proposal_id}`
-        : `${sessionId ?? "draft"}_la_${item.action.audit_id || item.timestamp}`;
+        : item.kind === "scheduled_proposal"
+          ? `${sessionId ?? "draft"}_srp_${item.proposal.proposal_id}`
+          : `${sessionId ?? "draft"}_la_${item.action.audit_id || item.timestamp}`;
       rows.push({ sort: item.timestamp, render: "live", item, key });
     }
     return rows.sort((a, b) => a.sort - b.sort);
@@ -1671,6 +1693,13 @@ export function Agent() {
                       committed={row.item.committed}
                       onAdjust={submitComposerPrompt}
                     />
+                  </div>
+                );
+              }
+              if (row.item.kind === "scheduled_proposal") {
+                return (
+                  <div key={row.key} className={shouldAnimate ? "msg-enter" : undefined}>
+                    <ScheduledResearchProposalCard proposal={row.item.proposal} />
                   </div>
                 );
               }

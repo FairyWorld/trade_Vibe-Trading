@@ -6,9 +6,13 @@ import type { RunData } from "@/lib/api";
 const apiMock = vi.hoisted(() => ({
   getRun: vi.fn(),
   getRunCode: vi.fn(),
+  getRunFactor: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({ api: apiMock }));
+vi.mock("@/components/charts/FactorResearchPanel", () => ({
+  FactorResearchPanel: () => <div data-testid="factor-panel" />,
+}));
 vi.mock("@/components/charts/CandlestickChart", () => ({
   CandlestickChart: () => <div data-testid="candlestick-chart" />,
 }));
@@ -44,6 +48,7 @@ describe("RunDetail page", () => {
   beforeEach(() => {
     apiMock.getRun.mockReset();
     apiMock.getRunCode.mockReset();
+    apiMock.getRunFactor.mockReset();
   });
 
   it("presents a readable strategy title instead of promoting the run id", async () => {
@@ -234,6 +239,57 @@ describe("RunDetail page", () => {
     expect(keyCell.closest("table")?.parentElement).toHaveClass("overflow-x-auto");
     expect(screen.getByRole("columnheader", { name: "Path" })).toHaveClass("ps-4");
     expect(screen.getByText("artifacts/result.json")).toHaveClass("ps-4");
+  });
+
+  it("renders the Factor Research tab from has_factor_artifacts and lazy-loads the report", async () => {
+    apiMock.getRun.mockResolvedValue({
+      status: "success",
+      run_id: "factor-run",
+      prompt: "Factor run",
+      has_factor_artifacts: true,
+    });
+    apiMock.getRunCode.mockResolvedValue({});
+    apiMock.getRunFactor.mockResolvedValue({
+      exists: true,
+      factors: [{
+        name: "momentum_20d",
+        path: "artifacts/factor_momentum_20d",
+        ic_series: [{ date: "2024-01-02", ic: 0.03 }],
+        ic_stats: { ic_mean: 0.03, ic_std: 0.02, ir: 1.5, ic_positive_ratio: 0.6, ic_count: 1 },
+        group_equity: [{ date: "2024-01-02", Group_1: 1, Group_2: 1.01 }],
+        n_groups: 2,
+        long_short_spread: 0.01,
+        group_final_equity: { Group_1: 1, Group_2: 1.01 },
+      }],
+      ic_correlation: null,
+    });
+
+    renderRunDetail("/runs/factor-run");
+
+    await screen.findByText("Factor run");
+    // The factor report is fetched lazily on tab open, never with the main run payload.
+    expect(apiMock.getRunFactor).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Factor Research" }));
+
+    expect(await screen.findByTestId("factor-panel")).toBeInTheDocument();
+    expect(apiMock.getRunFactor).toHaveBeenCalledWith("factor-run");
+  });
+
+  it("hides the Factor Research tab when the run has no factor artifacts", async () => {
+    apiMock.getRun.mockResolvedValue({
+      status: "success",
+      run_id: "no-factor-run",
+      prompt: "No factor run",
+      trade_log: [],
+    });
+    apiMock.getRunCode.mockResolvedValue({});
+
+    renderRunDetail("/runs/no-factor-run");
+
+    await screen.findByText("No factor run");
+    expect(screen.queryByRole("tab", { name: "Factor Research" })).not.toBeInTheDocument();
+    expect(apiMock.getRunFactor).not.toHaveBeenCalled();
   });
 });
 

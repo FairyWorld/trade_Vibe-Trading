@@ -24,6 +24,7 @@ from src.quantlib.timeseries import (
     find_hedge_ratio,
     fit_garch,
     fit_markov_regime,
+    fit_ornstein_uhlenbeck,
     granger_test,
     heteroscedasticity_test,
     vif_test,
@@ -702,7 +703,7 @@ def test_importing_the_module_does_not_require_the_optional_backends():
 
     module = importlib.import_module("src.quantlib.timeseries")
 
-    assert len(module.__all__) == 12
+    assert len(module.__all__) == 13
     assert "statsmodels" not in module.__dict__
     assert "arch" not in module.__dict__
 
@@ -838,3 +839,68 @@ def test_markov_raises_an_actionable_error_when_statsmodels_is_absent():
 
     with pytest.raises(ImportError, match="pip install"):
         fit_markov_regime(pd.Series(np.random.default_rng(37).normal(0, 0.01, 100)))
+
+# --- Ornstein-Uhlenbeck calibration ---
+
+
+@requires_statsmodels
+def test_ornstein_uhlenbeck_recovers_known_parameters():
+    rng = np.random.default_rng(42)
+    true_theta = 0.5
+    true_mu = 10.0
+    true_sigma = 1.2
+    dt = 1.0
+    n = 2000
+
+    # Exact AR(1) simulation for OU
+    b = np.exp(-true_theta * dt)
+    a = true_mu * (1.0 - b)
+    sigma_eps = np.sqrt(true_sigma**2 / (2 * true_theta) * (1.0 - b**2))
+
+    x = np.zeros(n)
+    x[0] = true_mu
+    for t in range(1, n):
+        x[t] = a + b * x[t - 1] + rng.normal(0, sigma_eps)
+
+    series = pd.Series(x)
+    result = fit_ornstein_uhlenbeck(series, dt=dt)
+
+    assert result["is_mean_reverting"] is True
+    assert result["theta"] == pytest.approx(true_theta, rel=0.15)
+    assert result["mu"] == pytest.approx(true_mu, rel=0.05)
+    assert result["sigma"] == pytest.approx(true_sigma, rel=0.15)
+    assert result["half_life"] == pytest.approx(np.log(2) / result["theta"], abs=1e-12)
+    assert result["stationary_variance"] == pytest.approx(
+        result["sigma"] ** 2 / (2 * result["theta"]), rel=1e-6
+    )
+    assert result["stationary_std"] == pytest.approx(
+        np.sqrt(result["stationary_variance"]), abs=1e-12
+    )
+
+
+@requires_statsmodels
+def test_ornstein_uhlenbeck_random_walk_reports_non_reverting():
+    rng = np.random.default_rng(43)
+    # Random walk: b = 1.0
+    rw = np.cumsum(rng.normal(0, 1, 500))
+    result = fit_ornstein_uhlenbeck(pd.Series(rw))
+
+    if not result["is_mean_reverting"]:
+        assert result["half_life"] == float("inf")
+
+
+@requires_statsmodels
+def test_ornstein_uhlenbeck_input_validation():
+    series = pd.Series([1.0, 2.0, 3.0, 2.5, 2.0])
+
+    with pytest.raises(ValueError, match="dt must be strictly positive"):
+        fit_ornstein_uhlenbeck(series, dt=0.0)
+
+    with pytest.raises(ValueError, match="dt must be strictly positive"):
+        fit_ornstein_uhlenbeck(series, dt=-1.0)
+
+    with pytest.raises(ValueError, match="at least 3 lag pairs"):
+        fit_ornstein_uhlenbeck(pd.Series([1.0, 2.0]))
+
+    with pytest.raises(ValueError, match="constant"):
+        fit_ornstein_uhlenbeck(pd.Series([5.0, 5.0, 5.0, 5.0]))

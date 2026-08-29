@@ -302,7 +302,9 @@ class RenderShadowReportTool(BaseTool):
                         missed_signals_pnl=0.0, noise_trades_pnl=0.0, early_exit_pnl=0.0,
                         late_exit_pnl=0.0, overtrading_pnl=0.0, counterfactual_trades=(),
                     ),
-                    shadow_total_pnl=0.0, real_total_pnl=0.0, delta_pnl=0.0,
+                    shadow_total_pnl=None,
+                    real_total_pnl=0.0,
+                    delta_pnl=None,
                 )
 
         today_signals = (

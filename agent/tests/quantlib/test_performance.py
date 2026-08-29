@@ -352,6 +352,73 @@ def test_xirr_discounts_by_actual_days() -> None:
     assert (1.0 + half_year) ** (182 / 365) == pytest.approx(1.10, rel=1e-6)
 
 
+def test_xirr_survives_a_horizon_that_underflows_the_discount_factor() -> None:
+    """Sixty years underflows the factor at the solver's lower bracket.
+
+    The bisection starts just above -100%, where a 60-year discount factor
+    (``1e-6 ** 60 ~ 1e-360``) underflows to zero and the term diverges. The
+    search must still return the exact flat rate the dates imply,
+    ``3 ** (365 / 21915) - 1``, instead of crashing with a division by zero.
+    """
+    start, end = date(1965, 1, 1), date(2025, 1, 1)
+    days = (end - start).days  # 21915 calendar days, 15 leap days included
+    rate = xirr([(start, -1000.0), (end, 3000.0)])
+    assert rate == pytest.approx(3.0 ** (365.0 / days) - 1.0, rel=1e-9)
+
+
+def test_a_long_horizon_loss_still_solves_to_a_negative_rate() -> None:
+    """The underflow stand-in must not flip the sign of a losing stream."""
+    start, end = date(1965, 1, 1), date(2025, 1, 1)
+    days = (end - start).days
+    rate = xirr([(start, -1000.0), (end, 500.0)])
+    assert rate == pytest.approx(0.5 ** (365.0 / days) - 1.0, rel=1e-9)
+
+
+def test_money_weighted_return_survives_the_same_long_horizon() -> None:
+    """The money-weighted path shares the NPV kernel and must not crash either."""
+    start, end = date(1965, 1, 1), date(2025, 1, 1)
+    result = money_weighted_return([(start, 1000.0), (end, 3000.0)])
+    assert result.period_return == pytest.approx(2.0, abs=1e-9)
+    assert result.annualized_return == pytest.approx(
+        3.0 ** (365.0 / (end - start).days) - 1.0, rel=1e-9
+    )
+
+
+def test_xirr_survives_a_horizon_in_the_subnormal_discount_window() -> None:
+    """~52 years leaves the discount factor subnormal rather than zero.
+
+    At the lower bracket ``1e-6 ** 52 ~ 6e-313`` is a denormal, so the closing
+    term overflows to infinity before the factor underflows. The result must
+    still be the exact flat rate, and must not depend on ``fsum`` tolerating
+    infinity on any given platform.
+    """
+    start, end = date(1965, 1, 1), date(2017, 1, 1)
+    days = (end - start).days
+    rate = xirr([(start, -1000.0), (end, 3000.0)])
+    assert rate == pytest.approx(3.0 ** (365.0 / days) - 1.0, rel=1e-9)
+
+
+def test_long_horizon_opposite_signed_terms_do_not_cancel_to_nan() -> None:
+    """Two subnormal-window terms must resolve to the latest-dated flow.
+
+    With both the 2016 and 2017 terms overflowing, the old kernel sums
+    ``-inf + inf = nan`` and the bisection silently walks to its upper bracket.
+    Grouping diverging terms by exponent keeps the latest-dated flow dominant,
+    exactly as the limit requires, and the solver must return the rate that
+    zeroes the stream.
+    """
+    start, mid, end = date(1965, 1, 1), date(2016, 1, 1), date(2017, 1, 1)
+    rate = xirr([(start, -1000.0), (mid, -500.0), (end, 2000.0)])
+    years = [(day - start).days / 365.0 for day in (start, mid, end)]
+    residual = (
+        -1000.0
+        - 500.0 / (1.0 + rate) ** years[1]
+        + 2000.0 / (1.0 + rate) ** years[2]
+    )
+    assert abs(residual) < 1e-6
+    assert 0.0 < rate < 1.0
+
+
 def test_a_one_directional_stream_has_no_irr() -> None:
     """Refusing is correct; there is no rate that zeroes an all-negative NPV."""
     with pytest.raises(UnsolvableRateError, match="one-directional"):

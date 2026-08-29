@@ -78,9 +78,30 @@ class TestEnvConfigDefaults:
         assert c.llm.vibe_trading_disable_http_proxy is False
         assert c.llm.max_retries == 2
         assert c.llm.langchain_reasoning_effort == ""
+        assert c.llm.langchain_use_responses_api is None
         assert c.llm.vibe_trading_deepseek_adapter == "auto"
         assert c.llm.moonshot_user_agent == ""
         assert c.llm.openai_codex_base_url == "https://chatgpt.com/backend-api/codex/responses"
+
+    def test_llm_responses_api_reads_boolean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "true")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is True
+
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "false")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
+
+    @pytest.mark.parametrize("value", ["TRUE", "yes", "1", "on"])
+    def test_llm_responses_api_requires_literal_true(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", value)
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
 
     def test_data_defaults(self) -> None:
         c = EnvConfig()
@@ -103,6 +124,13 @@ class TestEnvConfigDefaults:
         assert c.data.longbridge_app_key == ""
         assert c.data.longbridge_app_secret == ""
         assert c.data.longbridge_access_token == ""
+        # Per-market source-order overrides default to unset (default chains).
+        for market in (
+            "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
+            "ca_equity", "vietnam_equity", "crypto", "futures", "fund",
+            "macro", "forex",
+        ):
+            assert getattr(c.data, f"market_data_order_{market}") == ""
 
     def test_api_defaults(self) -> None:
         c = EnvConfig()
@@ -125,6 +153,8 @@ class TestEnvConfigDefaults:
         assert c.swarm.swarm_timeout == 1800
         assert c.swarm.swarm_heartbeat_interval_s == 3.0
         assert c.swarm.swarm_stream_retry_delay_s == 1.0
+        assert c.swarm.swarm_worker_retry_base_delay_s == 1.0
+        assert c.swarm.swarm_worker_retry_max_delay_s == 30.0
         assert c.swarm.swarm_grounding_max_symbols == 8
 
     def test_agent_tuning_defaults(self) -> None:

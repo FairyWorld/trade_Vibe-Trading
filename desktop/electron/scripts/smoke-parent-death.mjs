@@ -4,6 +4,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { startUnrelatedPythonSentinel } from "./process-sentinel.mjs";
 
 if (process.platform !== "win32") {
   console.log("Parent-death smoke is Windows-specific; skipped on this platform.");
@@ -18,6 +19,7 @@ const testDirectory = await mkdtemp(path.join(os.tmpdir(), "vibe-desktop-parent-
 const readyFile = path.join(testDirectory, "ready.json");
 const userData = path.join(testDirectory, "user-data");
 const output = [];
+const unrelatedPython = await startUnrelatedPythonSentinel();
 const electronMain = spawn(electronPath, [electronRoot, "--disable-gpu"], {
   cwd: electronRoot,
   windowsHide: true,
@@ -52,6 +54,11 @@ try {
     20_000,
     `Backend listener ${ready.backendOrigin} survived Electron main termination`,
   );
+  assert.equal(
+    unrelatedPython.isAlive(),
+    true,
+    "Parent-death cleanup terminated an unrelated Python process",
+  );
 
   console.log(JSON.stringify({
     killedPid: ready.mainPid,
@@ -60,6 +67,8 @@ try {
     backendOrigin: ready.backendOrigin,
     backendExited: true,
     listenerClosed: true,
+    unrelatedPythonPid: unrelatedPython.pid,
+    unrelatedPythonSurvived: true,
   }, null, 2));
 } finally {
   if (electronMain.pid && isProcessAlive(electronMain.pid)) {
@@ -68,6 +77,7 @@ try {
   if (ready?.backendPid && isProcessAlive(ready.backendPid)) {
     await killProcessTree(ready.backendPid);
   }
+  await unrelatedPython.stop();
 }
 
 async function waitForReadyFile(filePath, timeoutMs, child, capturedOutput) {

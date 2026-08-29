@@ -23,7 +23,76 @@ $gtkInstallerName = 'gtk3-runtime-3.24.31-2022-01-04-ts-win64.exe'
 $gtkInstallerPath = Join-Path $gtkCacheRoot $gtkInstallerName
 $gtkInstallerUrl = "https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer/releases/download/2022-01-04/$gtkInstallerName"
 $gtkInstallerSha256 = 'd05e1488ca0e6ffaabb579bbeb82113c099152ca4260ebc63084b0dd174d4558'
-$gtkInstallRoot = Join-Path $gtkCacheRoot 'runtime'
+$gtkExtractRoot = Join-Path $gtkCacheRoot 'archive-runtime-v1'
+
+. (Join-Path $PSScriptRoot 'process-utils.ps1')
+
+function Get-VerifiedDownload {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$CurlPath
+    )
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $DestinationPath).Hash.ToLowerInvariant()
+        if ($actual -ne $ExpectedSha256) {
+            throw "$Label checksum mismatch. Expected $ExpectedSha256, got $actual"
+        }
+        return
+    }
+
+    New-Item -ItemType Directory -Path (Split-Path -Parent $DestinationPath) -Force | Out-Null
+    $temporaryPath = "$DestinationPath.download-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        & $CurlPath `
+            --fail `
+            --location `
+            --silent `
+            --show-error `
+            --connect-timeout 30 `
+            --max-time 180 `
+            --retry 2 `
+            --retry-max-time 420 `
+            --retry-delay 2 `
+            --retry-all-errors `
+            --output $temporaryPath `
+            $Uri
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Label download failed."
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $temporaryPath).Hash.ToLowerInvariant()
+        if ($actual -ne $ExpectedSha256) {
+            throw "$Label checksum mismatch. Expected $ExpectedSha256, got $actual"
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-SevenZip {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $command = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        $candidates.Add($command.Source)
+    }
+    if ($env:ProgramFiles) {
+        $candidates.Add((Join-Path $env:ProgramFiles '7-Zip\7z.exe'))
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidates.Add((Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe'))
+    }
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    throw '7z.exe is required to extract the checksum-pinned GTK archive without executing its legacy installer.'
+}
 
 if (-not $BuildPython) {
     $repoVenvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
@@ -47,22 +116,16 @@ if (-not (Test-Path -LiteralPath $requirementsLock)) {
     throw 'desktop/electron/requirements-windows-lock.txt is missing. Windows packaging requires its platform-specific hash-locked dependencies.'
 }
 
-New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
-if (-not (Test-Path -LiteralPath $archivePath)) {
-    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-    if (-not (Test-Path -LiteralPath $curl)) {
-        throw 'Windows curl.exe is unavailable.'
-    }
-    & $curl --fail --location --retry 3 --output $archivePath $archiveUrl
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Python embeddable package download failed.'
-    }
+$curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+if (-not (Test-Path -LiteralPath $curl)) {
+    throw 'Windows curl.exe is unavailable.'
 }
-
-$actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
-if ($actualSha256 -ne $expectedSha256) {
-    throw "Python archive checksum mismatch. Expected $expectedSha256, got $actualSha256"
-}
+Get-VerifiedDownload `
+    -Uri $archiveUrl `
+    -DestinationPath $archivePath `
+    -ExpectedSha256 $expectedSha256 `
+    -Label 'Python embeddable package' `
+    -CurlPath $curl
 
 if ($Clean -and (Test-Path -LiteralPath $runtimeRoot)) {
     $resolvedRuntime = (Resolve-Path -LiteralPath $runtimeRoot).Path
@@ -190,31 +253,10 @@ foreach ($directory in $pruneRoots) {
 Write-Host ("Pruned {0} packaged test files ({1:N1} MB)" -f $removedFiles, ($reclaimedBytes / 1MB))
 
 # WeasyPrint needs Pango/Cairo/GLib on Windows. Copy only the verified
-# rendering dependency closure, not the GTK UI or developer payloads.
-New-Item -ItemType Directory -Path $gtkCacheRoot -Force | Out-Null
-if (-not (Test-Path -LiteralPath $gtkInstallerPath)) {
-    Invoke-WebRequest -UseBasicParsing -Uri $gtkInstallerUrl -OutFile $gtkInstallerPath
-}
-$actualGtkSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gtkInstallerPath).Hash.ToLowerInvariant()
-if ($actualGtkSha256 -ne $gtkInstallerSha256) {
-    throw "GTK runtime checksum mismatch. Expected $gtkInstallerSha256, got $actualGtkSha256"
-}
-$gtkGObject = Join-Path $gtkInstallRoot 'bin\libgobject-2.0-0.dll'
-if (-not (Test-Path -LiteralPath $gtkGObject)) {
-    New-Item -ItemType Directory -Path $gtkInstallRoot -Force | Out-Null
-    $gtkInstall = Start-Process `
-        -FilePath $gtkInstallerPath `
-        -ArgumentList @('/S', "/D=$gtkInstallRoot") `
-        -Wait `
-        -PassThru
-    if ($gtkInstall.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $gtkGObject)) {
-        throw "GTK runtime extraction failed (exit code $($gtkInstall.ExitCode))."
-    }
-}
-
-$runtimeGtk = Join-Path $runtimeRoot 'gtk'
-New-Item -ItemType Directory -Path (Join-Path $runtimeGtk 'bin') -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $runtimeGtk 'etc') -Force | Out-Null
+# rendering dependency closure, not the GTK UI or developer payloads. The
+# upstream asset is an NSIS executable, but executing that legacy self-
+# extractor intermittently access-violates or hangs on GitHub Windows images.
+# Treat the checksum-pinned asset strictly as data and extract it with 7-Zip.
 $gtkRuntimeDlls = @(
     'libbrotlicommon.dll', 'libbrotlidec.dll', 'libbz2-1.dll', 'libdatrie-1.dll',
     'libexpat-1.dll', 'libffi-7.dll', 'libfontconfig-1.dll', 'libfreetype-6.dll',
@@ -224,14 +266,61 @@ $gtkRuntimeDlls = @(
     'libpangoft2-1.0-0.dll', 'libpcre-1.dll', 'libpng16-16.dll', 'libstdc++-6.dll',
     'libthai-0.dll', 'libwinpthread-1.dll', 'zlib1.dll'
 )
+Get-VerifiedDownload `
+    -Uri $gtkInstallerUrl `
+    -DestinationPath $gtkInstallerPath `
+    -ExpectedSha256 $gtkInstallerSha256 `
+    -Label 'GTK runtime archive' `
+    -CurlPath $curl
+
+$gtkArchiveBin = Join-Path $gtkExtractRoot '$_63_'
+$gtkArchiveFonts = Join-Path $gtkExtractRoot 'etc\fonts'
+$gtkGObject = Join-Path $gtkArchiveBin 'libgobject-2.0-0.dll'
+if (-not (Test-Path -LiteralPath $gtkGObject) -or -not (Test-Path -LiteralPath $gtkArchiveFonts)) {
+    if (Test-Path -LiteralPath $gtkExtractRoot) {
+        throw "Cached GTK archive extraction is incomplete: $gtkExtractRoot"
+    }
+    $sevenZip = Resolve-SevenZip
+    $temporaryExtractRoot = "$gtkExtractRoot.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        New-Item -ItemType Directory -Path $temporaryExtractRoot -Force | Out-Null
+        if ($temporaryExtractRoot.Contains('"') -or $gtkInstallerPath.Contains('"')) {
+            throw 'GTK archive paths must not contain quote characters.'
+        }
+        $sevenZipArguments = 'x -y "-o{0}" "{1}"' -f $temporaryExtractRoot, $gtkInstallerPath
+        Invoke-BoundedProcess `
+            -FilePath $sevenZip `
+            -Arguments $sevenZipArguments `
+            -TimeoutSeconds 120 `
+            -Label 'GTK archive extraction'
+
+        $temporaryBin = Join-Path $temporaryExtractRoot '$_63_'
+        $missingDlls = @(
+            $gtkRuntimeDlls |
+                Where-Object { -not (Test-Path -LiteralPath (Join-Path $temporaryBin $_)) }
+        )
+        $temporaryFonts = Join-Path $temporaryExtractRoot 'etc\fonts'
+        if ($missingDlls.Count -gt 0 -or -not (Test-Path -LiteralPath $temporaryFonts)) {
+            throw "GTK archive is missing required runtime files: $($missingDlls -join ', ')"
+        }
+        Move-Item -LiteralPath $temporaryExtractRoot -Destination $gtkExtractRoot
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$runtimeGtk = Join-Path $runtimeRoot 'gtk'
+New-Item -ItemType Directory -Path (Join-Path $runtimeGtk 'bin') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $runtimeGtk 'etc') -Force | Out-Null
 foreach ($gtkDll in $gtkRuntimeDlls) {
     Copy-Item `
-        -LiteralPath (Join-Path $gtkInstallRoot "bin\$gtkDll") `
+        -LiteralPath (Join-Path $gtkArchiveBin $gtkDll) `
         -Destination (Join-Path $runtimeGtk 'bin') `
         -Force
 }
 Copy-Item `
-    -LiteralPath (Join-Path $gtkInstallRoot 'etc\fonts') `
+    -LiteralPath $gtkArchiveFonts `
     -Destination (Join-Path $runtimeGtk 'etc') `
     -Recurse `
     -Force

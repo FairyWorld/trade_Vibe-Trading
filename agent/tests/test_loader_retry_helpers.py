@@ -263,6 +263,7 @@ def test_stubbed_config_cannot_enable_cache_or_redirect_root_into_cwd(monkeypatc
 
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     stub = MagicMock()
     monkeypatch.setattr(
         "src.config.accessor.get_env_config", lambda: stub, raising=False

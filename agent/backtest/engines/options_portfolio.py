@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from backtest.engines.base import evaluation_start_index
+from backtest.metrics import effective_bars_per_year
 from src.quantlib.options import bs_greeks, bs_price, normalise_option_type
 
 
@@ -175,7 +177,7 @@ def run_options_backtest(
     loader: Any,
     engine: Any,
     run_dir: Path,
-    bars_per_year: int = 252,
+    bars_per_year: int | None = 252,
 ) -> Dict[str, Any]:
     """Options backtest entry point.
 
@@ -231,6 +233,12 @@ def run_options_backtest(
     for df in data_map.values():
         all_dates.update(df.index)
     dates = sorted(all_dates)
+
+    # Warm-up bars primed the signal engine above; from here they do not exist,
+    # so nothing they contain reaches a fill, the equity curve or a metric.
+    warmup_end = evaluation_start_index(config, pd.DatetimeIndex(dates))
+    if warmup_end:
+        dates = dates[warmup_end:]
 
     # Index signals by date
     signal_by_date: Dict[str, List[Dict[str, Any]]] = {}
@@ -555,7 +563,7 @@ def _calc_options_metrics(
     equity: pd.Series,
     initial_cash: float,
     trades: List[Dict[str, Any]],
-    bars_per_year: int = 252,
+    bars_per_year: int | None = 252,
 ) -> Dict[str, Any]:
     """Calculate options backtest metrics.
 
@@ -572,6 +580,13 @@ def _calc_options_metrics(
     n = len(equity)
     equity_vals = pd.to_numeric(equity, errors="coerce").astype(float)
     path_is_finite = bool(n and np.isfinite(equity_vals.to_numpy()).all())
+
+    # Cross-market convention (runner.py passes bars_per_year=None): resolve
+    # it through the shared span-derived factor. Without this, every None
+    # comparison below (<= 0 / > 0) raises TypeError instead of returning
+    # metrics.
+    if bars_per_year is None:
+        bars_per_year = effective_bars_per_year(equity_vals.index)
 
     final_raw: float | None = None
     final_value: float | None = None

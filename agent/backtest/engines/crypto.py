@@ -99,7 +99,7 @@ class CryptoEngine(BaseEngine):
         loader: Any,
         signal_engine: Any,
         run_dir: Path,
-        bars_per_year: int = 252,
+        bars_per_year: int | None = 252,
     ) -> dict[str, Any]:
         self._validate_strict_resolution(config)
         self._run_interval = str(config.get("interval", "1D"))

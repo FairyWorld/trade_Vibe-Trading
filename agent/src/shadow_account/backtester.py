@@ -270,6 +270,7 @@ def run_shadow_backtest(
         profile=profile,
         journal_path=journal_path,
         combined=combined,
+        initial_capital=initial_capital,
     )
 
     result = ShadowBacktestResult(
@@ -280,7 +281,7 @@ def run_shadow_backtest(
         attribution=attribution,
         shadow_total_pnl=shadow_pnl,
         real_total_pnl=real_pnl,
-        delta_pnl=round(shadow_pnl - real_pnl, 2),
+        delta_pnl=round(shadow_pnl - real_pnl, 2) if shadow_pnl is not None else None,
     )
     _cache_result(base_dir, result)
     return result
@@ -312,9 +313,9 @@ def load_cached_result(shadow_id: str) -> ShadowBacktestResult | None:
             overtrading_pnl=float(attr.get("overtrading_pnl", 0.0)),
             counterfactual_trades=tuple(attr.get("counterfactual_trades") or ()),
         ),
-        shadow_total_pnl=float(data.get("shadow_total_pnl", 0.0)),
+        shadow_total_pnl=(None if data.get("shadow_total_pnl") is None else float(data["shadow_total_pnl"])),
         real_total_pnl=float(data.get("real_total_pnl", 0.0)),
-        delta_pnl=float(data.get("delta_pnl", 0.0)),
+        delta_pnl=None if data.get("delta_pnl") is None else float(data["delta_pnl"]),
     )
 
 
@@ -466,14 +467,38 @@ def _per_market_breakdown(
 
 # ---------------- Attribution ----------------
 
+def _shadow_pnl_from_metrics(combined: dict[str, float], initial_capital: float) -> float | None:
+    """Absolute shadow PnL in the pool's currency, or None when unknown.
+
+    The runner only emits ``final_value`` and ``total_return``; the explicit
+    keys are accepted first for older artifacts. A genuine zero is a valid
+    PnL, so presence is checked with ``is not None`` throughout.
+    """
+    explicit = combined.get("total_return_abs")
+    if explicit is None:
+        explicit = combined.get("total_pnl")
+    if explicit is not None:
+        return float(explicit)
+    final_value = combined.get("final_value")
+    if final_value is not None:
+        return float(final_value) - initial_capital
+    total_return = combined.get("total_return")
+    if total_return is not None:
+        return float(total_return) * initial_capital
+    return None
+
+
 def _attribution_or_zero(
     *,
     profile: ShadowProfile,
     journal_path: str | Path | None,
     combined: dict[str, float],
-) -> tuple[AttributionBreakdown, float, float]:
+    initial_capital: float,
+) -> tuple[AttributionBreakdown, float | None, float]:
     """Compute attribution if the journal is available, else return zeros."""
-    shadow_pnl = float(combined.get("total_return_abs") or combined.get("total_pnl") or 0.0)
+    shadow_pnl = _shadow_pnl_from_metrics(combined, initial_capital)
+    if shadow_pnl is None:
+        return _zero_attribution(), None, 0.0
     if not journal_path:
         return _zero_attribution(), shadow_pnl, 0.0
     path = Path(journal_path)

@@ -516,6 +516,91 @@ def test_binance_classification() -> None:
     assert BINANCE_TOOL_CLASS["create_order"] is ToolClass.WRITE
     assert BINANCE_TOOL_CLASS["cancel_order"] is ToolClass.WRITE
     assert BINANCE_TOOL_CLASS["fetch_balance"] is ToolClass.READ
+    assert BINANCE_TOOL_CLASS["load_markets"] is ToolClass.READ
+
+
+def test_binance_search_instruments_resolves_exact_active_spot_pair(monkeypatch) -> None:
+    class FakeExchange:
+        def load_markets(self):
+            return {
+                "ETH/USDT": {
+                    "id": "ETHUSDT",
+                    "symbol": "ETH/USDT",
+                    "spot": True,
+                    "active": True,
+                },
+                "ETH/USDT:USDT": {
+                    "id": "ETHUSDT",
+                    "symbol": "ETH/USDT:USDT",
+                    "spot": False,
+                    "active": True,
+                },
+                "BTC/USDT": {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT",
+                    "spot": True,
+                    "active": True,
+                },
+            }
+
+    monkeypatch.setattr(bn, "_exchange", lambda _cfg: FakeExchange())
+
+    result = bn.search_instruments(
+        "ETHUSDT",
+        config=bn.BinanceConfig(profile="paper"),
+    )
+
+    assert result == {
+        "status": "ok",
+        "query": "ETHUSDT",
+        "instruments": [
+            {
+                "symbol": "ETH-USDT",
+                "native_symbol": "ETH/USDT",
+                "exchange_symbol": "ETHUSDT",
+                "base": "ETH",
+                "quote": "USDT",
+                "market": "crypto",
+                "type": "cryptocurrency",
+                "exchange": "BINANCE",
+                "active": True,
+            }
+        ],
+    }
+
+
+def test_binance_search_instruments_does_not_guess_prose(monkeypatch) -> None:
+    def _unexpected_exchange(_cfg):
+        raise AssertionError("prose lookup must not load the Binance market catalog")
+
+    monkeypatch.setattr(bn, "_exchange", _unexpected_exchange)
+
+    result = bn.search_instruments(
+        "Ethereum",
+        config=bn.BinanceConfig(profile="paper"),
+    )
+
+    assert result == {"status": "ok", "query": "Ethereum", "instruments": []}
+
+
+def test_service_routes_instrument_search_to_selected_binance_profile(monkeypatch) -> None:
+    captured = {}
+
+    def _search(query, *, config, limit):
+        captured.update(query=query, profile=config.profile, limit=limit)
+        return {"status": "ok", "instruments": [{"symbol": "ETH-USDT"}]}
+
+    monkeypatch.setattr(bn, "search_instruments", _search)
+
+    result = service.search_instruments(
+        "ETH-USDT",
+        "binance-paper-trade",
+        limit=3,
+    )
+
+    assert captured == {"query": "ETH-USDT", "profile": "paper", "limit": 3}
+    assert result["profile_id"] == "binance-paper-trade"
+    assert result["connector"] == "binance"
 
 
 def test_binance_service_unconfigured(monkeypatch, tmp_path) -> None:
@@ -523,6 +608,57 @@ def test_binance_service_unconfigured(monkeypatch, tmp_path) -> None:
     result = service.check_connection("binance-paper-sdk")
     assert result["status"] == "error"
     assert result["connector"] == "binance"
+
+
+def test_binance_positions_replace_ld_wrappers_with_simple_earn(monkeypatch) -> None:
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "USDT": {"free": 12, "used": 0, "total": 12},
+                "LDBTC": {"free": 0, "used": 0.9, "total": 0.9},
+            }
+
+        def sapi_get_simple_earn_flexible_position(self, params):
+            assert params == {"size": 100}
+            return {"rows": [{"asset": "BTC", "totalAmount": "1.0"}]}
+
+    monkeypatch.setattr(bn, "_exchange", lambda _cfg: FakeExchange())
+    result = bn.get_positions(
+        bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly")
+    )
+
+    assert result["positions"] == [
+        {"symbol": "USDT", "quantity": 12.0, "free": 12.0, "used": 0.0, "source": "spot"},
+        {
+            "symbol": "BTC",
+            "quantity": 1.0,
+            "free": 0.0,
+            "used": 1.0,
+            "source": "simple_earn_flexible",
+        },
+    ]
+
+
+def test_binance_exchange_adjusts_for_server_time(monkeypatch) -> None:
+    captured = {}
+
+    class FakeExchange:
+        def __init__(self, config):
+            captured.update(config)
+
+        def set_sandbox_mode(self, enabled):
+            captured["sandbox"] = enabled
+
+    monkeypatch.setattr(bn, "_require_ccxt", lambda: SimpleNamespace(binance=FakeExchange))
+    monkeypatch.setattr(bn, "getproxies", lambda: {})
+
+    bn._exchange(bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly"))
+
+    assert captured["options"] == {
+        "adjustForTimeDifference": True,
+        "recvWindow": 10_000,
+    }
+    assert captured["sandbox"] is False
 
 
 # --------------------------------------------------------------------------- #

@@ -5,6 +5,284 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-08-20
+
+Rolls up 272 commits / 74 merged pull requests since 0.1.13.
+
+### Added
+
+- **Options Lab** (#1096, closes #1095, thanks @shadowinlife) — a Web UI page
+  with four surfaces: expiry payoff diagram, spot×IV scenario P&L matrix,
+  portfolio Greeks cards, and a live US options chain. The math is not new: two
+  read-only HTTP endpoints wrap the existing `options_payoff` /
+  `get_options_chain` tools, so the page and the MCP surface compute from the
+  same test-pinned `src/quantlib/options.py`. Research only — it places no
+  orders.
+- **Factor Research tab** in Run Detail (#1099, thanks @shadowinlife) — IC
+  statistics cards, the daily IC series with its mean line, quantile-group
+  equity curves, and an IC correlation heatmap, all rendered from the
+  `factor_analysis` artifacts a run already writes. The new read-only
+  `GET /runs/{run_id}/factor` endpoint scans the run's `artifacts/` tree and
+  computes the pairwise IC time-series correlation matrix, which existed
+  nowhere before; a `has_factor_artifacts` flag gates the tab so runs without
+  factor output do not show an empty panel.
+- **Positions tab** in Run Detail (#1097, closes #1098, thanks @shadowinlife) —
+  portfolio-book structure from the existing `positions.csv`: a per-symbol
+  weight pie/treemap with a date slider, sector and asset-class net-exposure
+  bars, and a weight-evolution stacked area. The pie is **gross** composition
+  (absolute weights including shorts and cash) while the bars are **net**
+  exposure per industry, so a long/short pair in one sector nets to zero on the
+  bars while both legs stay visible on the pie. The two charts answer different
+  questions on purpose.
+- **Tearsheet tab** in Run Detail (#1091, closes #1090, thanks @shadowinlife) —
+  monthly-returns heatmap (years × months with a full-year column), annual
+  returns bar chart, top-5 drawdown table, and an equity curve annotated with
+  the ranked drawdown zones. Everything is derived client-side from the
+  `equity.csv` rows the run response already carries: no backend change, no new
+  dependency, and month axis labels come from `Intl.DateTimeFormat` rather than
+  per-locale month keys.
+- **Interactive backtest research dashboard** (#1084, thanks @AndyLongest) — an
+  optional report-style view for a completed backtest alongside the existing
+  candlestick and trade-detail views: headline return/risk/trading KPIs,
+  normalized equity versus benchmark, drawdown with rolling Sharpe, realized
+  trade P&L, a trade ledger, and the complete metric table. CLI backtests get a
+  quiet local report-server bootstrap so `Full Report` routes to the dashboard
+  without a manual server step.
+- **Strategy Discovery** (#978 Phase 1 and #1007 Phase 2, refs #969, thanks
+  @shadowinlife) — a read-only facade answering "what strategies exist and what
+  state are they in?" across the Alpha Zoo and the SDM strategy store, with
+  per-`(strategy, regime)` evidence rows rather than scenario tags. Ships
+  `list_strategies` / `query_strategies` / `get_strategy_evidence` as agent and
+  MCP tools behind an evidence gate (minimum-trade, coverage and
+  cost-breakeven thresholds, each with an explicit warning), plus a startup
+  guard that drops the routing text when any advertised tool is not actually
+  registered. Phase 2 adds the population path — `refresh_strategy_evidence`
+  as an agent tool, an MCP wrapper and
+  `vibe-trading strategy-evidence refresh --manifest` — with the
+  `backtest-diagnose` Hard-Gate Checklist as the ingestion gate (stable
+  `hard-gate:*` skip tokens) and atomic rebuilds. Freshness is computed at read
+  time from the evidence-window age (`fresh`/`aging`/`stale`); stale rows fail
+  closed out of default recommendations behind an `include_stale` opt-out, and
+  `sdm:*` rows mirror the SDM lifecycle.
+- **Scheduled research now delivers itself.** A finished briefing leaves the
+  run through an outbox rather than waiting to be read: the outbox row is
+  claimed under a lease before sending so a crash mid-delivery cannot double
+  post, the send is wired to both the session and the channel runtimes, and the
+  push happens on the terminal event. Delivery is configured and watched from
+  Market Watch.
+- **Each monitor's latest verdict is persisted on its job** (#1152, refs #943,
+  thanks @he-yufeng) — the run's terminal briefing is parsed server-side into a
+  structured `last_verdict` record and the `/scheduled-runs` list carries it
+  inline, so the list renders a verdict without re-parsing free text per row or
+  going N+1 on sessions. The five research playbooks grow a strictly additive
+  `## Verdict` tail — one `- SYMBOL: STATE - reason` line per tracked symbol,
+  each playbook declaring its own state vocabulary. Parsing is deliberately
+  strict: an ad-hoc prompt lands permanently at `no_verdict_section` and renders
+  as nothing rather than a warning, a run that tracked nothing is a real "no
+  calls" answer rather than an absence, and a malformed section degrades to
+  `contract_violation` instead of showing a wrong verdict. The prior record is
+  embedded one level deep at write time and no deeper.
+- **Futu connector — seven extended read-only endpoints** (#1135, thanks
+  @549236606-oss) closing the gap between what the SDK exposes and what the
+  connector consumed: `get_rehab` (dividend/split/rights adjustment factors, so
+  backtests stop reading dividend gaps as price moves), `get_capital_flow`
+  (historical super/big/mid/small inflow buckets), `get_capital_distribution`
+  (today's in-flow versus out-flow snapshot), `get_history_deals` (fill records
+  for true cost-basis reconstruction, capped at the SDK's 360-day window),
+  `get_acc_cash_flow`, `get_financials` (income/balance/cash-flow statements),
+  and `get_earnings_calendar` with EPS and revenue consensus. Each routes
+  through the same `_quote_ctx` / `_trade_ctx` / `_assert_gateway` envelope as
+  the original five, so missing data, missing privileges and a missing OpenD all
+  degrade to a clean fail-closed payload instead of an SDK stack trace. The
+  `futu-api` SDK stays lazily loaded.
+- **Vietnam equities (HOSE)** as a backtest market (#1033, thanks @ngoanpv).
+  `.VN` matched no entry in `_MARKET_PATTERNS`, so `_detect_market` fell back to
+  `a_share` and executed Vietnamese bars under China A-share rules — and asking
+  for Yahoo explicitly did not help, because both Yahoo loaders gated on suffix
+  and rejected `.VN` before building the request. `.VN` now resolves through the
+  Yahoo loaders with a `["yahoo", "yfinance", "local"]` fallback chain and runs
+  on a dedicated `VietnamEquityEngine`.
+- **Offline USD-M account reconciliation** (#1106, relates #1030, thanks
+  @honginp) — immutable Binance USD-M account and position snapshot contracts
+  that compare an exchange observation against the existing `AccountState` and
+  `RiskSnapshot` without mutating either, reporting numeric, structural,
+  missing-symbol and unexpected-symbol drift deterministically. Liquidation-engine
+  validation is explicitly left unassessed rather than silently assumed. This is
+  the Shadow 1 slice: contracts and fixture-only offline reconciliation.
+- **Novita AI** as a built-in OpenAI-compatible provider (#1059, thanks
+  @jax-novita) — registered in the provider registry with `NOVITA_API_KEY` /
+  `NOVITA_BASE_URL` and wired through capabilities, CLI onboarding,
+  `.env.example` and the README provider list, so it is selectable from the
+  built-in list instead of hand-configured as a custom endpoint.
+- **GitHub Copilot** as a provider through the official `github-copilot-sdk`
+  (#990, supersedes #899, thanks @sykuang), with SDK-managed authentication from
+  `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, stored Copilot CLI
+  credentials or `gh` credentials, plus LangChain-compatible invoke, streaming,
+  reasoning and tool-call handling and Settings/preflight integration. This
+  implements the boundary #899 was closed on: no borrowed OAuth client ID and no
+  editor-impersonation headers.
+- **tickerall hosted MetaTrader 5 data source** (#968, closes #897, thanks
+  @miguelangelo78) — a broker's MetaTrader 5 candle feed over the hosted
+  TickerAll HTTP API, so forex and metals backtests run on any OS with no local,
+  logged-in MetaTrader 5 terminal. Purely opt-in: `is_available()` is False
+  unless `TICKERALL_API_KEY` and `TICKERALL_ACCOUNT_ID` are set, and the loader
+  never joins an automatic chain.
+- **A drift tolerance band for rebalance mode** — a rebalance that would move
+  the book by less than the band is skipped rather than executed for a rounding
+  difference.
+- **Spanish and German locales** (#1087 thanks @daviddaco1, #1117 thanks
+  @1psconstructor). Spanish ships a full key-for-key `es.json` plus
+  `README_es.md`, making Spanish the sixth README; German ships `de.json` with
+  the full UI key set. Both register in `SUPPORTED_LANGUAGES` and
+  `localeLoaders` on the existing lazy-loading path, and the locale-parity and
+  interpolation-variable tests cover them.
+- **Desktop update safety boundary** (#1101, refs #1016, thanks @QCYTSN) — a
+  strict PID-scoped backend/watchdog shutdown result for a future update
+  handoff, dormant Windows candidate verification, interrupted-attempt recovery
+  primitives, and a documented, tested rejection matrix for tampered, unsigned,
+  invalid-signature, wrong-publisher and downgraded candidates. The signed
+  `0.3.0 → 0.3.1` run itself remains blocked on a signing identity; this is the
+  part that could be made executable before a certificate exists, including the
+  proof that desktop cleanup never kills unrelated Python processes.
+- **Docker images carry the Feishu and Telegram channel dependencies** (#1088,
+  thanks @birdxs), with a manually triggered workflow that builds and pushes to
+  both GHCR and Docker Hub and syncs the project description to the Docker Hub
+  page.
+- **Strict alpha t-stats** in the bench JSON and HTML report (#1085, thanks
+  @jay79-boop), so the strict-mode number is readable from the artifact instead
+  of only the console.
+- **Offset paging on the MCP surface** for SEC filings and financial statements
+  (#1138), and `load_skill` routed through the registry so an oversized skill
+  pages instead of being truncated at the transport limit (#1137).
+
+### Changed
+
+- **The MCP surface grows to 74 tools** (from 70 in 0.1.13).
+- **`smartmoneyconcepts` is now an opt-in `[smc]` extra, not a base
+  dependency** — and the stale `<3.14` cap is gone from both the project
+  metadata and the distribution manifest. The package pulled in
+  `numba` → `llvmlite`, and llvmlite ships no macOS x86_64 wheel from 0.46
+  onward, so as a base dependency it turned every Intel-Mac install into a
+  source build that needs CMake (discussion #1035). It backs exactly one skill
+  example, whose `SKILL.md` already tells the reader to install it. Intel-Mac
+  users on Python 3.11–3.13 can now `pip install vibe-trading-ai` without a
+  toolchain.
+- **CI runs the test job on both the floor and the ceiling of
+  `requires-python`**, so a version-specific break at either end is caught
+  before release rather than by a user.
+- **Vite moves from 6.4.3 to 8.2.0** in the frontend dev toolchain (#1022).
+- **Market-data provenance now declares per-market volume units** (#1065,
+  #1131, thanks @shadowinlife), and `get_market_data` carries that provenance
+  over MCP rather than dropping it at the transport boundary.
+- **The Ollama runtime URL is normalized at source** (#1074) instead of being
+  patched at each call site.
+
+### Fixed
+
+- **A run's grounding gate stops refusing answers it can support.** The
+  identity/price recovery path now re-fetches missing evidence within a bounded
+  budget instead of rejecting outright (#1092, thanks @Shizoqua); identity
+  constants in rate formulas are no longer read as unsupported quotes (#1083,
+  thanks @AndyLongest); line-leading ordered-list markers are masked before
+  number extraction (#1063, thanks @zzz607); ISO dates that run straight into
+  CJK text are recognised as dates (#1132, thanks @Robin1987China); a
+  report-style date cell parses as a date and a US CSV stem resolves; a
+  dash-form trading day reads as a date and both bounds of a ranged level are
+  masked; an order line is read as an instruction rather than an observed
+  quote; and an "@" level is masked only when a quantity or an order label
+  accompanies it, so a bare price is still held to the evidence standard.
+- **Agent run reliability** (#1105, thanks @wiliao) — grounding
+  false-rejections, the final-answer gate and LLM timeouts, together with
+  prompt wording and support/resistance masking (#1060).
+- **`build_registry()` no longer returns a partial registry in silence**
+  (#1129, thanks @er-s-an): a construction failure is reported instead of
+  leaving the caller with a short tool list that looks complete.
+- **Backtest correctness**: `excess_return` stays consistent with the corrected
+  `benchmark_return` (#1058, thanks @Shizoqua) and the corrected benchmark
+  fields are rounded to the metrics contract; the engine reports actual
+  post-fill positions rather than the requested ones (#1082, thanks
+  @AndyLongest); hold mode says so when it drops a requested resize; the
+  archive no longer mixes two runs' artifacts into one bundle; and importing
+  the runner module no longer loads `.env` as a side effect.
+- **Quantlib numerics**: `xirr` and money-weighted return survive long-horizon
+  discount underflow instead of crashing (#1119, thanks @pengpengyi92); DCF
+  refuses non-finite inputs rather than returning a silently negative share
+  price (#1121, thanks @Robin1987China); a zero-volatility option discounts its
+  forward value (#1066), the fixed-income curve keeps decay inside the
+  requested bounds (#1076), event studies anchor to the prior session (#1078),
+  and cross-validation aligns label ends to the prior observation (#1079) — all
+  thanks @pengpengyi92. `technical_indicator` RSI uses Wilder EWM smoothing
+  (#1056, thanks @Shizoqua).
+- **Swarm**: worker prompts are ordered for prompt-cache-friendly prefixes
+  (#1057, thanks @Echoandelementwebsites); worker artifacts are isolated between
+  retry attempts (#1053) and a path-shaped agent id is rejected before the retry
+  `rmtree`; raw `ok`/`success` tool-result envelopes are rejected (#1052) and
+  oversized tool results truncate with the shared notice (#1110) — thanks
+  @Shizoqua; tool-less agents are no longer instructed to call `write_file`
+  (#1144, thanks @Echoandelementwebsites); and the per-task `ChatLLM` is closed
+  to stop a pooled-connection leak (#1145, thanks @cgycorey), with the same
+  treatment for the one-shot clients in auto-title and image vision (#1153).
+- **Connectors and market data**: baostock volume is normalized to board lots
+  behind a cross-source consistency guard (#1067, thanks @shadowinlife); the
+  IBKR market-data tier is selectable and starved quotes report as `no_data`
+  (#1075, thanks @jay79-boop), with the requested and the applied tier reported
+  separately; eToro gains runtime UI parity for SDK connector status (#1051) and
+  fixes crypto browse and flat market-data quotes (#1070, thanks @ofeksh-tr);
+  the `tencent` loader builds its SSL context from the certifi CA bundle, since
+  the new GlobalSign Atlas R3 root is absent from Python's default store and HK
+  quotes failed every retry (#1113, thanks @x-lambda); and the East Money
+  research-report endpoint gets the time parameters it now requires (#1077,
+  thanks @zzz607).
+- **CLI**: `connector orders` renders broker_sdk rows — the renderer only knew
+  the nested IBKR shape, so a flat row left every column but Account empty — and
+  stringified SDK enums print as `BUY` rather than `OrderSide.BUY`, while
+  class-B tickers such as `BRK.B` and decimal values are left intact (#1150,
+  thanks @nstavros); direct SDK account diagnostics render (#1073); the `show`
+  subcommand dispatches its `run_id` instead of the `--show` flag (#1147, thanks
+  @cgycorey); and a Docker Codex OAuth EOF explains itself (#1054, thanks
+  @zhiwuyazhe-fjr).
+- **Providers**: reasoning effort is honoured in chat completions (#1025, thanks
+  @cgycorey) and passed through to the Anthropic adapter (#1115, thanks
+  @straun-repo).
+- **A remote MCP failure reports the server's own explanation** instead of a
+  bare status code, so a rejected token reads as a rejected token (refs #1126).
+- **Scheduled research**: an in-flight delivery is no longer overwritten
+  (#1140, thanks @Shizoqua), and the `scheduled-runs` DELETE returns an empty
+  `Response` for its 204 (#1068, thanks @ofeksh-tr).
+- **Tools and agent**: unsupported ticker-plus-name symbol queries are marked
+  skipped rather than failed (#1114) and recovery steering is delivered as user
+  messages with inline system tags (#1112) — thanks @lorenzozanee;
+  prediction-market fields reject non-finite values and the envelope stays
+  strict JSON (#1136, thanks @Shizoqua); `gross_profit` is derived from revenue
+  minus COGS when the SEC tag is absent (#1111, thanks @cgycorey); every
+  compacted message folds through the summarizer; and the autopilot preserves
+  backtest validation evidence when linking hypotheses (#1139, thanks
+  @Shizoqua).
+- **Onboarding**: `.env.partial` is created with owner-only permissions (#1086,
+  thanks @lukiod) and written atomically, so a failed save cannot destroy
+  recovery state.
+- **Memory**: the fallback tokenizer's minimum is aligned with the FTS5
+  sanitizer (#1071, thanks @Shizoqua).
+- **Research reports** reject a reversed window instead of reporting it as
+  missing coverage.
+- **Web**: inferred strategy labels are marked as inferred in the run dashboard
+  (#1134, part 1 of #1094, thanks @fixXxerTech).
+- **The test suite no longer escapes its sandbox into the real config root**
+  (#1118, closes #1116, thanks @lorenzozanee). A full run had been appending
+  synthetic `order_rejected` records to the live, hash-chained audit ledger at
+  `~/.vibe-trading/live/audit.jsonl` and writing a `live/audit_chain.jsonl`
+  holding a single NUL byte. It was reported on Windows, but the escape was not
+  Windows-specific — a default macOS environment leaked the same way. The
+  config root is now sandboxed before collection, through one knob at the tail
+  of the resolution chain rather than a per-test override, and `os` patches are
+  confined to the module under test.
+  hash locks are portable across supported platforms (#1102); Windows desktop
+  packaging inputs are stabilized (#1104); the Docker build workflow is pinned
+  and the image stays on hash-locked dependencies; the alpha-bench SP500 panel
+  carries the GICS sector through; a frontend test waits on the sector
+  re-render rather than on the spinner disappearing; and the Spanish locale says
+  "demo", not "papel", for paper trading.
+
 ## [0.1.13] — 2026-08-10
 
 Rolls up 408 commits / 162 merged pull requests since 0.1.12.

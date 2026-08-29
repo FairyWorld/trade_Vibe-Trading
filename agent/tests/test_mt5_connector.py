@@ -203,6 +203,7 @@ def fake_mt5(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeMT5:
     fake = FakeMT5()
     monkeypatch.setattr(_client, "_require_mt5", lambda: fake)
     monkeypatch.setattr(_client, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr("src.live.paths.get_runtime_root", lambda: tmp_path)
     return fake
 
 

@@ -143,6 +143,9 @@ class _StubChatLLM:
     def chat(self, messages, tools=None, timeout=None):  # pragma: no cover — fallback path
         return self.stream_chat(messages, tools=tools)
 
+    def close(self) -> None:
+        """No-op: the stub owns no HTTP client."""
+
 
 def _stub_llm_factory(responses: list[LLMResponse]):
     """Build a callable that reads as ``ChatLLM(model_name=...)`` would.

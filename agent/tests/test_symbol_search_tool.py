@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+from src.trading import profiles as trading_profiles
+from src.trading import service as trading_service
 from src.tools import symbol_search_tool as ss
 
 
@@ -321,6 +323,60 @@ class TestSymbolSearchSuccess:
         payload = json.loads(out)
         assert payload["data"]["sources"]["eastmoney"] == "ok"
 
+    def test_selected_binance_profile_resolves_exact_pair_without_yahoo_collision(
+        self, monkeypatch
+    ):
+        """Issue #1234: an exchange pair must not resolve to a similarly named asset."""
+        connector_calls: list[tuple[str, str, int]] = []
+
+        def _search_connector(query: str, profile_id: str, *, limit: int, **_):
+            connector_calls.append((query, profile_id, limit))
+            return {
+                "status": "ok",
+                "connector": "binance",
+                "profile_id": profile_id,
+                "instruments": [
+                    {
+                        "symbol": "ETH-USDT",
+                        "native_symbol": "ETH/USDT",
+                        "exchange_symbol": "ETHUSDT",
+                        "market": "crypto",
+                        "type": "cryptocurrency",
+                        "exchange": "BINANCE",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(
+            trading_profiles,
+            "load_selected_profile_id",
+            lambda: "binance-paper-trade",
+        )
+        monkeypatch.setattr(trading_service, "search_instruments", _search_connector)
+
+        yahoo_collision = [
+            {
+                "symbol": "AETHUSDT-USD",
+                "shortname": "Aave Ethereum USDT USD",
+                "exchange": "CCC",
+                "quoteType": "CRYPTOCURRENCY",
+            }
+        ]
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.yahoo_client, "search", return_value=yahoo_collision):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="ETH-USDT", limit=5)
+            )["data"]
+
+        assert connector_calls == [("ETH-USDT", "binance-paper-trade", 5)]
+        assert data["sources"]["binance"] == "ok"
+        assert [candidate["symbol"] for candidate in data["candidates"]] == [
+            "ETH-USDT"
+        ]
+
 
 class TestSymbolSearchErrors:
     """Error envelopes and per-source resilience."""
@@ -352,6 +408,43 @@ class TestSymbolSearchErrors:
         assert sources["yahoo"] == "ok"
         symbols = {c["symbol"] for c in payload["data"]["candidates"]}
         assert "AAPL.US" in symbols
+
+    def test_binance_pair_lookup_failure_rejects_yahoo_near_match(
+        self, monkeypatch
+    ):
+        """A failed exact-pair lookup must not fall back to a different asset."""
+        monkeypatch.setattr(
+            trading_profiles,
+            "load_selected_profile_id",
+            lambda: "binance-paper-trade",
+        )
+
+        def _fail_connector(*_args, **_kwargs):
+            raise RuntimeError("market catalog unavailable")
+
+        monkeypatch.setattr(trading_service, "search_instruments", _fail_connector)
+        yahoo_collision = [
+            {
+                "symbol": "AETHUSDT-USD",
+                "shortname": "Aave Ethereum USDT USD",
+                "exchange": "CCC",
+                "quoteType": "CRYPTOCURRENCY",
+            }
+        ]
+        with patch.object(ss.yahoo_client, "search", return_value=yahoo_collision), \
+                patch.object(
+                    ss, "_load_public_markets", side_effect=RuntimeError("venue down")
+                ):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="ETH-USDT", limit=5)
+            )["data"]
+
+        assert data["sources"]["binance"] == (
+            "connector search failed: market catalog unavailable"
+        )
+        assert data["sources"]["eastmoney"].startswith("skipped:")
+        assert "venue down" in data["sources"]["public_exchange"]
+        assert data["candidates"] == []
 
     def test_sec_lookup_failure_recorded_not_fatal(self):
         with patch.object(
@@ -434,3 +527,238 @@ class TestShanghaiAliasAndUnsupportedQueries:
 
         search.assert_called_once()
         assert data["sources"]["yahoo"] == "ok"
+
+
+class TestTickerNameQueryYahooSkip:
+    """A ticker+name query Yahoo cannot serve must be skipped, not "ok".
+
+    Yahoo's search endpoint answers a multi-token query whose first token is a
+    bare all-caps ticker ("XOM ExxonMobil") with zero quotes. Recording that as
+    "ok" counted a second clean source, so a caller deciding whether an entity
+    exists read "not listed" as two corroborating "not found" answers; the
+    unsupported shape must read as "skipped" instead, mirroring the non-ASCII
+    guard. Eastmoney is NOT skipped for this shape — it can serve multi-token
+    queries — only the Yahoo path relabels.
+    """
+
+    def test_ticker_name_query_skips_yahoo_without_ok_status(self):
+        """Yahoo returns zero quotes for the shape and is relabeled "skipped"."""
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=[]
+        ) as search, patch.object(
+            ss.sec_edgar_client, "cik_for", return_value=None
+        ):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="XOM ExxonMobil")
+            )["data"]
+
+        # Post-response relabel, not a pre-call skip: Yahoo is still consulted.
+        search.assert_called_once()
+        assert data["sources"]["yahoo"].startswith("skipped:")
+        assert data["sources"]["eastmoney"] == "ok"
+        assert data["count"] == 0
+
+    def test_ticker_name_query_with_matching_quotes_stays_ok(self):
+        """The relabel must NOT fire when Yahoo can actually serve the shape."""
+        quotes = [
+            {
+                "symbol": "XOM",
+                "shortname": "Exxon Mobil Corp.",
+                "exchange": "NYQ",
+                "quoteType": "EQUITY",
+            }
+        ]
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=quotes
+        ) as search, patch.object(
+            ss.sec_edgar_client, "cik_for", return_value="0000034088"
+        ):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="XOM ExxonMobil")
+            )["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+        assert data["count"] == 1
+
+    def test_multi_word_name_query_still_reaches_yahoo(self):
+        """A multi-word NAME ("Exxon Mobil") is not a ticker+name shape."""
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=_yahoo_quotes()
+        ) as search, patch.object(
+            ss.sec_edgar_client, "cik_for", return_value="0000320193"
+        ):
+            data = json.loads(ss.SymbolSearchTool().execute(query="Exxon Mobil"))["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+
+    def test_single_token_query_still_reaches_yahoo(self):
+        """A bare single-token ticker ("XOM") is not a ticker+name shape."""
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=_yahoo_quotes()
+        ) as search, patch.object(
+            ss.sec_edgar_client, "cik_for", return_value="0000320193"
+        ):
+            data = json.loads(ss.SymbolSearchTool().execute(query="XOM"))["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+
+    def test_suffixed_ticker_with_name_still_reaches_yahoo(self):
+        """The bare-ticker clause must not fire on suffixed Canadian tickers."""
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=_yahoo_quotes()
+        ) as search:
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="BTO.TO B2Gold")
+            )["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+
+    def test_single_token_ascii_empty_result_stays_ok(self):
+        """A bare single token Yahoo cannot match is "not listed", not "skipped".
+
+        The relabel is shape-specific: only a multi-token ticker+name query is
+        unsupported. A single token (e.g. a bogus ticker) that returns zero
+        quotes is an authoritative "not listed" and must stay "ok", otherwise
+        every genuinely-absent entity would read as an unsupported shape.
+        """
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=[]
+        ) as search:
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="XOMZZZ")
+            )["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+
+    def test_multi_word_name_empty_result_stays_ok(self):
+        """A multi-word NAME ("Exxon Mobil") with zero quotes is "not listed".
+
+        The shape classifier keys on a bare all-caps FIRST token ("XOM
+        ExxonMobil"). A name-led query ("Exxon Mobil") is a shape Yahoo can
+        serve, so its empty answer is an authoritative "not listed" and must
+        not be relabeled to "skipped".
+        """
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=[]
+        ) as search:
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="Exxon Mobil")
+            )["data"]
+
+        search.assert_called_once()
+        assert data["sources"]["yahoo"] == "ok"
+
+
+class TestCryptoPairWithoutABrokerConnection:
+    """Resolving an exchange pair must not require a broker account.
+
+    #1242 routes exact pairs through the *selected* Binance connector, which
+    needs a configured profile and credentials. Identity resolution is a
+    read-only lookup against a public catalog — the same unauthenticated ccxt
+    connectivity ``orderbook_depth`` already uses to serve these pairs — so a
+    user with no broker connection must still get an identity rather than
+    nothing (or, before #1234, a near-string Yahoo asset).
+    """
+
+    @staticmethod
+    def _markets(*symbols):
+        return {sym: {"symbol": sym, "spot": True, "active": True} for sym in symbols}
+
+    def _run(self, monkeypatch, query, markets_by_exchange, yahoo=None):
+        monkeypatch.setattr(
+            trading_profiles, "load_selected_profile_id", lambda: "tiger-paper-sdk"
+        )
+
+        def _markets(exchange_id):
+            payload = markets_by_exchange.get(exchange_id)
+            if payload is None:
+                raise RuntimeError(f"{exchange_id} unavailable")
+            return payload
+
+        monkeypatch.setattr(ss, "_load_public_markets", _markets)
+        with patch.object(ss.yahoo_client, "search", return_value=yahoo or []):
+            return json.loads(ss.SymbolSearchTool().execute(query=query, limit=5))["data"]
+
+    def test_pair_resolves_with_no_connector_selected(self, monkeypatch):
+        data = self._run(
+            monkeypatch,
+            "ETH-USDT",
+            {"binance": self._markets("ETH/USDT", "BTC/USDT")},
+            yahoo=[
+                {
+                    "symbol": "AETHUSDT-USD",
+                    "shortname": "Aave Ethereum USDT USD",
+                    "exchange": "CCC",
+                    "quoteType": "CRYPTOCURRENCY",
+                }
+            ],
+        )
+        assert [c["symbol"] for c in data["candidates"]] == ["ETH-USDT"]
+        assert data["candidates"][0]["exchange"] == "BINANCE"
+        assert data["sources"]["public_exchange"] == "ok"
+
+    def test_second_venue_is_consulted_when_the_first_is_down(self, monkeypatch):
+        data = self._run(
+            monkeypatch, "SOL-USDT", {"okx": self._markets("SOL/USDT")}
+        )
+        assert [c["symbol"] for c in data["candidates"]] == ["SOL-USDT"]
+        assert data["candidates"][0]["exchange"] == "OKX"
+
+    def test_a_pair_no_venue_lists_resolves_to_nothing(self, monkeypatch):
+        data = self._run(
+            monkeypatch,
+            "NOTREAL-USDT",
+            {"binance": self._markets("ETH/USDT"), "okx": self._markets("ETH/USDT")},
+        )
+        assert data["candidates"] == []
+        assert data["sources"]["public_exchange"].startswith("skipped:")
+
+    def test_an_equity_query_never_reaches_the_venue_catalogs(self, monkeypatch):
+        called: list[str] = []
+
+        def _markets(exchange_id):
+            called.append(exchange_id)
+            return {}
+
+        monkeypatch.setattr(ss, "_load_public_markets", _markets)
+        monkeypatch.setattr(
+            trading_profiles, "load_selected_profile_id", lambda: "tiger-paper-sdk"
+        )
+        with patch.object(
+            ss.eastmoney_client, "get_json", return_value=_eastmoney_payload()
+        ), patch.object(ss.yahoo_client, "search", return_value=[]):
+            ss.SymbolSearchTool().execute(query="apple", limit=5)
+        assert called == []

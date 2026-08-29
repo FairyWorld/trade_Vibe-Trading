@@ -352,8 +352,11 @@ def test_run_shadow_backtest_with_mocked_runner(
         artifacts_dir = run_path / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = artifacts_dir / "metrics.json"
+        # Same key set the real runner emits (agent/src/core/runner.py
+        # metrics_csv): final_value/total_return, no explicit PnL field.
         metrics_path.write_text(json.dumps({
-            "total_return_abs": 12_345.0,
+            "final_value": 1_012_345.0,
+            "total_return": 0.012345,
             "sharpe": 1.5,
             "max_drawdown": -0.12,
             "win_rate": 0.55,
@@ -382,9 +385,9 @@ def test_run_shadow_backtest_with_mocked_runner(
     assert isinstance(result, ShadowBacktestResult)
     assert result.shadow_id == profile.shadow_id
     assert set(result.per_market.keys()) == {"china_a", "hk", "us", "crypto"}
-    assert result.combined["total_return_abs"] == 12_345.0
+    assert result.combined["final_value"] == 1_012_345.0
     assert result.combined["sharpe"] == 1.5
-    assert result.shadow_total_pnl == 12_345.0
+    assert result.shadow_total_pnl == pytest.approx(12_345.0)
     assert result.real_total_pnl > 0  # all profitable test data
     assert result.delta_pnl == round(result.shadow_total_pnl - result.real_total_pnl, 2)
     assert isinstance(result.attribution, AttributionBreakdown)
@@ -414,8 +417,81 @@ def test_run_shadow_backtest_handles_runner_failure(
         run_backtest_fn=failing_runner,
     )
     assert result.combined.get("error")
-    assert result.shadow_total_pnl == 0.0
+    assert result.shadow_total_pnl is None
+    assert result.delta_pnl is None
     assert result.equity_curves == {}
+
+    from src.shadow_account.backtester import load_cached_result
+
+    cached = load_cached_result(profile.shadow_id)
+    assert cached is not None
+    assert cached.shadow_total_pnl is None
+    assert cached.delta_pnl is None
+
+
+@pytest.mark.unit
+def test_shadow_pnl_derivation_from_runner_metrics() -> None:
+    from src.shadow_account.backtester import _shadow_pnl_from_metrics
+
+    # The exact metrics from the reported bad case: a completed A-share run
+    # whose only PnL signal is final_value/total_return.
+    metrics = {"final_value": 834_141.8041331805, "total_return": -0.1658581958668195, "trade_count": 16.0}
+    assert _shadow_pnl_from_metrics(metrics, 1_000_000.0) == pytest.approx(-165_858.20, abs=0.01)
+    # total_return alone carries the same information.
+    assert _shadow_pnl_from_metrics({"total_return": -0.1658581958668195}, 1_000_000.0) == pytest.approx(
+        -165_858.20, abs=0.01
+    )
+    # Explicit keys win when present, and a genuine zero is kept as zero.
+    assert _shadow_pnl_from_metrics({"total_return_abs": 0.0}, 1_000_000.0) == 0.0
+    assert _shadow_pnl_from_metrics({"total_return_abs": 5.0, "final_value": 1.0}, 1_000_000.0) == 5.0
+    assert _shadow_pnl_from_metrics({"total_pnl": -7.5}, 1_000_000.0) == -7.5
+    # No PnL signal at all means unknown, not zero.
+    assert _shadow_pnl_from_metrics({"sharpe": 1.2}, 1_000_000.0) is None
+    assert _shadow_pnl_from_metrics({}, 1_000_000.0) is None
+
+
+@pytest.mark.unit
+def test_run_shadow_backtest_derives_pnl_from_final_value(
+    profitable_journal: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end form of the reported bad case: runner-schema metrics in,
+    a real negative Shadow PnL out, and the None state survives the cache."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    profile = extract_shadow_profile(profitable_journal)
+
+    def stub_run_backtest(run_dir_str: str) -> str:
+        run_path = Path(run_dir_str)
+        artifacts_dir = run_path / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = artifacts_dir / "metrics.csv"
+        metrics_path.write_text(
+            "final_value,total_return,annual_return,max_drawdown,sharpe,win_rate,trade_count\n"
+            "834141.8041331805,-0.1658581958668195,-0.17,-0.21,-0.9,0.31,16\n",
+            encoding="utf-8",
+        )
+        return json.dumps({
+            "status": "ok",
+            "exit_code": 0,
+            "artifacts": {"metrics.csv": str(metrics_path)},
+        })
+
+    result = run_shadow_backtest(
+        profile,
+        window_start="2026-01-01",
+        window_end="2026-06-30",
+        journal_path=profitable_journal,
+        run_backtest_fn=stub_run_backtest,
+    )
+    assert result.shadow_total_pnl == pytest.approx(-165_858.20, abs=0.01)
+    assert result.delta_pnl == round(result.shadow_total_pnl - result.real_total_pnl, 2)
+
+    from src.shadow_account.backtester import load_cached_result
+
+    cached = load_cached_result(profile.shadow_id)
+    assert cached is not None
+    assert cached.shadow_total_pnl == pytest.approx(-165_858.20, abs=0.01)
+    assert cached.delta_pnl == result.delta_pnl
 
 
 # ---------------- M3b: per-currency multi-market runs ----------------
@@ -491,6 +567,33 @@ def test_group_selection_by_currency_us_crypto_single_group() -> None:
     })
     assert set(groups.keys()) == {"USD"}
     assert set(groups["USD"].keys()) == {"us", "crypto"}
+
+
+@pytest.mark.unit
+def test_group_selection_by_currency_names_vnd() -> None:
+    """A HOSE pool groups under VND, not an ``UNKNOWN:`` marker.
+
+    The group key is not merely a label: it names the pool's run directory
+    (``base_dir / currency``) and is rendered into the headline
+    ``_currency_note``. A market missing from the currency table would put a
+    colon into a path — illegal on Windows — and print the marker to the user.
+    """
+    groups = _group_selection_by_currency({"vietnam": ["VIC.VN", "FPT.VN"]})
+
+    assert set(groups.keys()) == {"VND"}
+    assert groups["VND"]["vietnam"] == ["VIC.VN", "FPT.VN"]
+    assert all(":" not in currency for currency in groups)
+
+
+@pytest.mark.unit
+def test_a_hose_pool_is_separated_from_other_currencies() -> None:
+    groups = _group_selection_by_currency({
+        "vietnam": ["VIC.VN"],
+        "us": _LIQUID_BASKETS["us"][:1],
+    })
+
+    assert set(groups.keys()) == {"VND", "USD"}
+    assert groups["VND"] == {"vietnam": ["VIC.VN"]}
 
 
 @pytest.mark.unit
@@ -648,7 +751,8 @@ def test_all_currency_groups_failure(
     )
     assert len(calls) == 3
     assert result.combined.get("error")
-    assert result.shadow_total_pnl == 0.0
+    assert result.shadow_total_pnl is None
+    assert result.delta_pnl is None
     assert result.equity_curves == {}
     assert all(row == {} for row in result.per_market.values())
 
@@ -726,12 +830,16 @@ def test_render_shadow_report_handles_empty_equity(
             missed_signals_pnl=0.0, noise_trades_pnl=0.0, early_exit_pnl=0.0,
             late_exit_pnl=0.0, overtrading_pnl=0.0, counterfactual_trades=(),
         ),
-        shadow_total_pnl=0.0, real_total_pnl=0.0, delta_pnl=0.0,
+        shadow_total_pnl=None, real_total_pnl=0.0, delta_pnl=None,
     )
     out = render_shadow_report(profile, result, output_dir=tmp_path)
     assert Path(out["html_path"]).exists()
+    content = Path(out["html_path"]).read_text(encoding="utf-8")
+    # An unknown shadow PnL renders as unavailable, never as a fake 0.00.
+    assert "unavailable" in content
+    assert "did not produce usable metrics" in content
     # Section 6 should degrade gracefully when no counterfactuals exist.
-    assert "No material counterfactual" in Path(out["html_path"]).read_text(encoding="utf-8")
+    assert "No material counterfactual" in content
 
 
 @pytest.mark.unit
@@ -922,6 +1030,9 @@ def test_attribution_is_zero_without_journal(
     assert result.attribution.noise_trades_pnl == 0.0
     assert result.real_total_pnl == 0.0
     assert result.attribution.counterfactual_trades == ()
+    # An explicit zero PnL is a real measurement, not a missing value.
+    assert result.shadow_total_pnl == 0.0
+    assert result.delta_pnl == 0.0
 
 
 # ---------------- Price-context features (as-of buy_dt) ----------------

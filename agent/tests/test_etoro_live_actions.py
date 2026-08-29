@@ -301,7 +301,7 @@ def test_service_edit_position_stops_live_fails_closed(monkeypatch) -> None:
     assert module.calls == []
 
 
-def test_service_etoro_copy_start_paper_bypasses_gate(monkeypatch) -> None:
+def test_service_etoro_copy_start_paper_returns_unavailable(monkeypatch) -> None:
     module = _FakeEtoroModule()
     monkeypatch.setattr(service, "_sdk_module", lambda connector: module)
     result = service.etoro_copy_start(
@@ -310,8 +310,9 @@ def test_service_etoro_copy_start_paper_bypasses_gate(monkeypatch) -> None:
         "etoro-paper-trade",
         reference_id="ref-1",
     )
-    assert result["status"] == "ok"
-    assert module.calls == ["copy_start"]
+    assert result["status"] == "error"
+    assert result["error_code"] == "copy_unavailable_on_paper"
+    assert module.calls == []
 
 
 def test_service_etoro_copy_increase_non_usd_live_account_fails_closed(

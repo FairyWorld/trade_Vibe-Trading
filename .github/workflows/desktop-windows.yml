@@ -2,6 +2,14 @@ name: Desktop Windows
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop-windows.yml"
+      - "agent/**"
+      - "desktop/electron/**"
+      - "frontend/**"
+      - "pyproject.toml"
   pull_request:
     paths:
       - ".github/workflows/desktop-windows.yml"
@@ -15,12 +23,10 @@ permissions:
 
 jobs:
   package:
-    # The checksum-pinned legacy GTK runtime extractor crashes on the Server
-    # 2025 image even though the resulting runtime works on current Windows.
-    # Keep packaging reproducible on the clean Server 2022 image until the
-    # native PDF dependency is replaced with a newer archive format.
-    runs-on: windows-2022
-    timeout-minutes: 90
+    # GTK is extracted as a checksum-pinned archive rather than executed as a
+    # legacy NSIS installer, so packaging can run on the current Windows image.
+    runs-on: windows-2025
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,9 +54,22 @@ jobs:
         working-directory: desktop/electron
         run: npm ci
 
+      - name: Verify dormant update rejection and recovery policy
+        working-directory: desktop/electron
+        run: npm run test:update-safety
+
+      - name: Prepare verified Electron runtime
+        working-directory: desktop/electron
+        run: npm run prepare:electron
+
       - name: Verify encrypted credential storage
         working-directory: desktop/electron
         run: npm run smoke:credentials
+
+      - name: Verify bounded native process adapter
+        working-directory: desktop/electron
+        shell: powershell
+        run: .\scripts\test-process-utils.ps1
 
       - name: Assemble minimal Python runtime
         working-directory: desktop/electron

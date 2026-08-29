@@ -12,12 +12,16 @@ from scipy.stats import genpareto, norm
 
 from src.quantlib.risk import (
     analyze_mc_results,
+    drawdown_distribution_analysis,
+    drawdown_series,
     fit_gpd_tail,
     historical_cvar,
     historical_var,
     max_drawdown_analysis,
     monte_carlo_gbm,
+    pain_index,
     parametric_var,
+    ulcer_index,
 )
 
 # 20 observations, already ascending: -0.10, -0.09, ..., 0.09.
@@ -521,3 +525,55 @@ def test_fit_gpd_tail_rejects_a_threshold_with_too_few_exceedances():
 def test_fit_gpd_tail_rejects_an_out_of_range_threshold(threshold_pct):
     with pytest.raises(ValueError, match="threshold_pct"):
         fit_gpd_tail(FIXED_RETURNS, threshold_pct=threshold_pct)
+
+# --------------------------------------------------------------------------
+# drawdown_series, ulcer_index, pain_index, drawdown_distribution_analysis
+# --------------------------------------------------------------------------
+
+
+def test_drawdown_series_exact_fractions():
+    equity = _dated([100.0, 120.0, 90.0, 100.0, 120.0])
+    dd = drawdown_series(equity)
+
+    assert dd.iloc[0] == pytest.approx(0.0)
+    assert dd.iloc[1] == pytest.approx(0.0)
+    assert dd.iloc[2] == pytest.approx(0.25)  # (120 - 90)/120 = 30/120 = 0.25
+    assert dd.iloc[3] == pytest.approx(20.0 / 120.0)  # (120 - 100)/120 = 1/6
+    assert dd.iloc[4] == pytest.approx(0.0)
+
+
+def test_ulcer_and_pain_index_computations():
+    equity = _dated([100.0, 120.0, 90.0, 120.0])
+    # dd values: [0.0, 0.0, 0.25, 0.0]
+    # PI = (0 + 0 + 0.25 + 0) / 4 = 0.0625
+    # UI = sqrt( (0 + 0 + 0.25^2 + 0) / 4 ) = sqrt( 0.0625 / 4 ) = 0.125
+    ui = ulcer_index(equity)
+    pi = pain_index(equity)
+
+    assert pi == pytest.approx(0.0625)
+    assert ui == pytest.approx(0.125)
+
+
+def test_drawdown_distribution_analysis_multiple_episodes():
+    # Episode 1: Peak at 100 (t=0), Trough at 80 (t=1), Recovery at 110 (t=2) -> max_depth=0.20, dur=2, recovered=True
+    # Episode 2: Peak at 110 (t=2), Trough at 99 (t=3), Recovery at 110 (t=4) -> max_depth=0.10, dur=2, recovered=True
+    # Episode 3: Peak at 120 (t=5), Trough at 108 (t=6), ongoing (t=6)        -> max_depth=0.10, dur=1, recovered=False
+    equity = _dated([100.0, 80.0, 110.0, 99.0, 110.0, 120.0, 108.0])
+    result = drawdown_distribution_analysis(equity)
+
+    assert result["episode_count"] == 3
+    assert result["max_drawdown"] == pytest.approx(0.20)
+    assert result["max_drawdown_duration"] == 2
+    assert result["avg_drawdown_depth"] == pytest.approx((0.20 + 0.10 + 0.10) / 3.0)
+    assert result["avg_drawdown_duration"] == pytest.approx(2.0)  # completed episodes duration
+    assert result["ulcer_index"] > 0.0
+    assert result["pain_index"] > 0.0
+
+    episodes = result["episodes"]
+    assert len(episodes) == 3
+    assert episodes[0]["recovered"] is True
+    assert episodes[0]["max_depth"] == pytest.approx(0.20)
+    assert episodes[1]["recovered"] is True
+    assert episodes[1]["max_depth"] == pytest.approx(0.10)
+    assert episodes[2]["recovered"] is False
+    assert episodes[2]["max_depth"] == pytest.approx(0.10)

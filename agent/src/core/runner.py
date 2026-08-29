@@ -129,12 +129,27 @@ def _prepare_sandbox_home(real_home: Path | None) -> Path:
                 src = src_root / rel
                 if not src.exists():
                     continue
+                dst = dst_root / rel
                 try:
-                    (dst_root / rel).symlink_to(src, target_is_directory=src.is_dir())
+                    dst.symlink_to(src, target_is_directory=src.is_dir())
                 except OSError:
-                    # Best-effort: a loader that can't find its config just falls
-                    # back to a live fetch / disabled cache — never a hard break.
-                    pass
+                    # Symlinks need privileges on Windows, so they can fail even
+                    # when nothing is fundamentally wrong. Fall back to a copy:
+                    # the loader cache/config paths stay visible to the subprocess
+                    # (the whole point of the re-exposure) without privileges.
+                    # Copies are per-run snapshots that the existing sandbox
+                    # cleanup removes, so the opt-in cache stops persisting across
+                    # runs only on hosts that cannot create symlinks.
+                    try:
+                        if src.is_dir():
+                            shutil.copytree(src, dst, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(src, dst)
+                    except OSError:
+                        # Best-effort: a loader that can't find its config just
+                        # falls back to a live fetch / disabled cache — never a
+                        # hard break.
+                        pass
             try:
                 os.chmod(dst_root, 0o755)
             except OSError:
