@@ -191,7 +191,7 @@ def _require_kite():
         from kiteconnect import KiteConnect  # type: ignore
     except ImportError as exc:  # optional dependency
         raise ZerodhaDependencyError(
-            "Optional dependency missing: install with `pip install kiteconnect`"
+            "Optional dependency missing: install with `pip install \"vibe-trading-ai[zerodha]\"`"
         ) from exc
     return KiteConnect
 
@@ -261,7 +261,7 @@ def check_status(config: ZerodhaConfig | None = None) -> dict[str, Any]:
         return report
     if not report["sdk"]["installed"]:
         report["status"] = "error"
-        report["error"] = "Optional dependency missing: install with `pip install kiteconnect`"
+        report["error"] = "Optional dependency missing: install with `pip install \"vibe-trading-ai[zerodha]\"`"
         return report
     return report
 
