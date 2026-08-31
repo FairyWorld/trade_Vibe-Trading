@@ -48,14 +48,14 @@ from src.live.runtime.flatten import flatten_and_cancel
 from src.live.runtime.jobstore import JobStore
 from src.live.runtime.sweep_latch import (
     claim_sweep,
-    halt_episode,
+    halt_snapshot,
     mark_sweep_fired,
     release_claim,
     sweep_already_fired,
 )
 from src.live.runtime.liveness import write_heartbeat
 from src.live.runtime.scheduler import Job
-from src.live.runtime.triggers import Trigger
+from src.live.runtime.triggers import Trigger, due_now
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 TICK_HALTED = "halted"
 TICK_NO_MANDATE = "no_mandate"
 TICK_EXPIRED = "expired"
+TICK_MARKET_CLOSED = "market_closed"
 TICK_RECONCILE_UNSAFE = "reconcile_unsafe"
 TICK_RECONCILE_ERROR = "reconcile_error"
 TICK_INVOKED = "invoked"
@@ -423,11 +424,14 @@ class LiveRunner:
         2. **Mandate + proactive expiry** — load the mandate; if absent or past
            ``expires_at``, trip a stop + clear authority + audit, and return
            BEFORE any agent invocation. A dead mandate never reaches step 5.
-        3. **Reconcile** — pull broker truth via the injected READ callables; an
+        3. **Market hours** — with market triggers attached, skip the tick when
+           every one of their markets is closed, so a weekend tick cannot queue
+           orders into the next open.
+        4. **Reconcile** — pull broker truth via the injected READ callables; an
            unsafe/ambiguous report aborts the tick (no auto-resend, §8 finding 5).
-        4. **Pin + invoke** — build the autonomous-turn prompt with the full
+        5. **Pin + invoke** — build the autonomous-turn prompt with the full
            mandate inline and invoke the agent through the public caller.
-        5. **Audit** — record the tick outcome.
+        6. **Audit** — record the tick outcome.
 
         Returns:
             A JSON-serializable tick result (see :meth:`TickResult.to_dict`).
@@ -443,6 +447,14 @@ class LiveRunner:
             return self._no_mandate_result()
         if _mandate_is_expired(mandate, now):
             return self._expired_result()
+
+        if not self._any_market_open(now):
+            logger.info("tick skipped for %s: market closed", self.broker)
+            return TickResult(
+                outcome=TICK_MARKET_CLOSED,
+                broker=self.broker,
+                reason="market closed",
+            ).to_dict()
 
         reconcile_outcome = self._run_reconcile()
         if reconcile_outcome is not None:
@@ -640,15 +652,21 @@ class LiveRunner:
         """
         if self._flatten_fired or self._submit_fn is None:
             return
-        if sweep_already_fired(self.broker):
+        # Capture ONE coherent halt snapshot before claiming. The claim, the
+        # already-fired check, the latch write and the release must all bind
+        # to the SAME view of the halt state: re-reading the sentinels later
+        # would let a mid-sweep clear/re-trip record an episode whose sweep
+        # never ran (next runner would skip it — positions stay open).
+        active_episodes, episode = halt_snapshot(self.broker)
+        episode = episode or "unknown"
+        if sweep_already_fired(self.broker, episode):
             self._flatten_fired = True
             return
-        # Resolve the episode ONCE: the claim and its release in ``finally``
-        # must refer to the same episode. Re-resolving at release time can
-        # bind to a NEWER episode (halt cleared + re-tripped mid-sweep) and
-        # delete that episode's claim — even a different process's — which
-        # would unprotect a concurrent sweep of the new episode.
-        episode = halt_episode(self.broker) or "unknown"
+        # The episode is resolved exactly once: the claim and its release in
+        # ``finally`` must refer to the same one. Re-resolving at release time
+        # can bind to a NEWER episode (halt cleared + re-tripped mid-sweep)
+        # and delete that episode's claim — even a different process's —
+        # which would unprotect a concurrent sweep of the new episode.
         if not claim_sweep(self.broker, episode):
             # Another process holds this episode's claim (or a crash left it
             # behind): the outcome is unknowable — re-sweeping could duplicate
@@ -681,7 +699,7 @@ class LiveRunner:
                 # and are not retryable — latch so a restart does not replay.
                 self._flatten_fired = True
                 try:
-                    mark_sweep_fired(self.broker)
+                    mark_sweep_fired(self.broker, active_episodes)
                 except Exception as persist_exc:  # noqa: BLE001 — double failure
                     # Both the sweep AND the durable latch write failed: the
                     # in-memory flag still shields this process, and the
@@ -750,7 +768,7 @@ class LiveRunner:
                 return
             self._flatten_fired = True
             try:
-                mark_sweep_fired(self.broker)
+                mark_sweep_fired(self.broker, active_episodes)
             except Exception as exc:  # noqa: BLE001 — persistence must not be silent
                 # Durability failure AFTER a broker write: the in-memory flag
                 # protects this process, but a restart sees no latch and could
@@ -928,6 +946,25 @@ class LiveRunner:
             except Exception:  # noqa: BLE001 — persistence is best-effort at start
                 logger.exception("job store save failed for %s", self.broker)
         return synthesized
+
+    def _any_market_open(self, now: datetime) -> bool:
+        """Whether any attached MARKET trigger's market is open at ``now``.
+
+        Runners without MARKET triggers are always open (interval-only or
+        event-driven channels never gate on sessions). With several MARKET
+        triggers the union wins: one open market is enough to trade. 24/7
+        markets (crypto) report open at every instant, so they never block.
+        """
+        now_ms = int(now.timestamp() * 1000)
+        market_triggers = [
+            trigger
+            for trigger in self._triggers or []
+            if getattr(getattr(trigger, "kind", None), "value", getattr(trigger, "kind", None))
+            == "market"
+        ]
+        if not market_triggers:
+            return True
+        return any(due_now(trigger, now_ms) for trigger in market_triggers)
 
     def _jobs_from_triggers(self, now: datetime) -> list[Job]:
         """Convert the injected triggers (R3) into schedulable watch jobs (R1).

@@ -35,6 +35,9 @@ _MARKET_PATTERNS = [
     # Canada equities: Toronto Stock Exchange (TD.TO) and TSX Venture
     # (PNG.V). Yahoo carries both suffixes verbatim.
     (re.compile(r"^[A-Z0-9&.\-]+\.(TO|V)$", re.I), "ca_equity"),
+    # UK equities: London Stock Exchange (VOD.L, SHEL.L). Yahoo carries the
+    # suffix verbatim.
+    (re.compile(r"^[A-Z0-9&.\-]+\.L$", re.I), "uk_equity"),
     # Vietnam equities: HOSE (VIC.VN). Tickers are three letters in practice;
     # the class stays broad to admit fund certificates and ETF codes.
     (re.compile(r"^[A-Z0-9]+\.VN$", re.I), "vietnam_equity"),
@@ -64,9 +67,11 @@ _MARKET_PATTERNS = [
 
 _CHINA_EXCHANGES = {"CFFEX", "SHFE", "DCE", "ZCE", "INE", "GFEX"}
 
-# Settlement currency per market. A composite backtest holds one shared capital
-# pool, so a code set spanning two of these would add CNY to USD to KRW as if
-# they were the same unit.
+# Supported settlement-currency contract per market. A composite backtest holds
+# one shared capital pool, so a code set spanning two of these would add CNY to
+# USD to KRW as if they were the same unit. The suffix alone cannot prove an
+# LSE line's currency; UK loaders admit only declared GBP/GBp and reject every
+# other/unknown quote before it reaches this table.
 _MARKET_CURRENCY = {
     "a_share": "CNY",
     "us_equity": "USD",
@@ -74,6 +79,7 @@ _MARKET_CURRENCY = {
     "india_equity": "INR",
     "kr_equity": "KRW",
     "ca_equity": "CAD",
+    "uk_equity": "GBP",
     "vietnam_equity": "VND",
     # Every crypto pattern in _MARKET_PATTERNS is USDT-quoted, and USDT is
     # carried at its USD peg. This is the one approximation in the table: a
@@ -91,7 +97,7 @@ _FUTURES_EXCHANGE_CURRENCY = {"EUREX": "EUR"}
 
 
 def code_currency(code: str) -> str:
-    """Return the currency a symbol settles in.
+    """Return the supported settlement-currency contract for a symbol.
 
     Args:
         code: Ticker / symbol string.
@@ -186,13 +192,14 @@ def _is_china_futures(code: str) -> bool:
 
 
 def _detect_submarket(codes: List[str]) -> str:
-    """Detect US, HK, or Canada from symbol suffixes.
+    """Detect US, HK, Canada, or UK from symbol suffixes.
 
     Args:
         codes: Instrument codes.
 
     Returns:
-        ``"hk"`` for ``.HK``, ``"ca"`` for ``.TO``/``.V``, else ``"us"``.
+        ``"hk"`` for ``.HK``, ``"ca"`` for ``.TO``/``.V``, ``"uk"`` for
+        ``.L``, else ``"us"``.
     """
     for code in codes:
         upper = code.upper()
@@ -200,6 +207,8 @@ def _detect_submarket(codes: List[str]) -> str:
             return "hk"
         if upper.endswith((".TO", ".V")):
             return "ca"
+        if upper.endswith(".L"):
+            return "uk"
     return "us"
 
 # ── Crypto: OKX tiered maintenance margin table (simplified) ──

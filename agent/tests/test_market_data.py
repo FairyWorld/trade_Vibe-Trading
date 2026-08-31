@@ -405,12 +405,24 @@ def test_fetch_loader_error_falls_through_to_unresolved() -> None:
 
 
 def test_fetch_missing_symbol_listed_as_unresolved() -> None:
+    class _OnlyALoader:
+        """Serves A.US on every source; B.US fails everywhere down the chain."""
+
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            idx = pd.to_datetime(["2026-01-01"])
+            idx.name = "trade_date"
+            return {
+                code: pd.DataFrame({"close": [1.0]}, index=idx)
+                for code in codes
+                if code == "A.US"
+            }
+
     out = fetch_market_data(
         codes=["A.US", "B.US"],
         start_date="2026-01-01",
         end_date="2026-01-02",
         source="yahoo",
-        loader_resolver=lambda src: _PartialLoader,
+        loader_resolver=lambda src: _OnlyALoader,
     )
     assert "A.US" in out
     assert out["_unresolved"] == ["B.US"]
@@ -501,10 +513,10 @@ def test_fetch_canadian_aliases_sibling_already_resolved() -> None:
     assert "HIVE.V" in out and "HIVE.TO" in out
     assert out["HIVE.V"] == out["HIVE.TO"]  # aliased — identical bars
     # The .V symbol must be aliased from the already-resolved .TO sibling:
-    # exactly one group fetch (both codes together), no separate re-fetch of
-    # the sibling after the fact.
-    assert len(calls) == 1
+    # the group fetch covered both codes, and any later chain attempts for the
+    # missing .V sibling returned nothing, so the alias is the only resolution.
     assert set(calls[0]) == {"HIVE.V", "HIVE.TO"}
+    assert all(call == ["HIVE.V"] for call in calls[1:])
     assert out["_provenance"]["HIVE.V"]["resolved_symbol"] == "HIVE.TO"
     assert out["_provenance"]["HIVE.V"]["venue_fallback"] is True
 
@@ -704,3 +716,79 @@ def test_fetch_json_rejects_nan_via_allow_nan_false() -> None:
     )
     parsed = json.loads(payload)
     assert parsed["A.US"][0]["close"] is None
+
+
+def test_fetch_auto_partial_batch_retries_missing_symbols_down_chain() -> None:
+    """One 404 out of five must not strand the rest in _unresolved.
+
+    yahoo serves four of five US symbols and omits the fifth; the chain walk
+    must keep going with only the missing symbol so stooq can serve it, and
+    provenance must name the source each symbol actually came from.
+    """
+    idx = pd.to_datetime(["2026-01-01"])
+    idx.name = "trade_date"
+    stooq_calls: list[list[str]] = []
+
+    class _YahooPartialLoader:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            return {
+                code: pd.DataFrame({"close": [1.0]}, index=idx)
+                for code in codes
+                if code != "MSFT.US"
+            }
+
+    class _StooqLoader:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            stooq_calls.append(list(codes))
+            return {code: pd.DataFrame({"close": [2.0]}, index=idx) for code in codes}
+
+    def resolver(src: str):
+        return {"yahoo": _YahooPartialLoader, "stooq": _StooqLoader}[src]
+
+    out = fetch_market_data(
+        codes=["AAPL.US", "MSFT.US", "NVDA.US", "AMZN.US", "META.US"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=resolver,
+        include_provenance=True,
+    )
+
+    prov = out["_provenance"]
+    assert "_unresolved" not in out
+    assert "MSFT.US" in out
+    assert stooq_calls == [["MSFT.US"]]
+    assert prov["MSFT.US"]["source"] == "stooq"
+    assert prov["MSFT.US"]["fallback_used"] is True
+    assert prov["AAPL.US"]["source"] == "yahoo"
+
+
+def test_fetch_auto_full_batch_never_touches_the_next_source() -> None:
+    """When the chain head serves everything, the walk stops as before."""
+    stooq_calls: list[list[str]] = []
+
+    class _YahooFullLoader:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            idx = pd.to_datetime(["2026-01-01"])
+            idx.name = "trade_date"
+            return {code: pd.DataFrame({"close": [1.0]}, index=idx) for code in codes}
+
+    class _StooqLoader:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            stooq_calls.append(list(codes))
+            idx = pd.to_datetime(["2026-01-01"])
+            idx.name = "trade_date"
+            return {code: pd.DataFrame({"close": [2.0]}, index=idx) for code in codes}
+
+    def resolver(src: str):
+        return {"yahoo": _YahooFullLoader, "stooq": _StooqLoader}[src]
+
+    out = fetch_market_data(
+        codes=["AAPL.US", "NVDA.US"],
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        source="auto",
+        loader_resolver=resolver,
+    )
+    assert stooq_calls == []
+    assert "AAPL.US" in out and "NVDA.US" in out

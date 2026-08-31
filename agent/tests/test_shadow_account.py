@@ -1259,7 +1259,8 @@ def test_promoted_features_threshold() -> None:
     promoted = _promoted_numeric_features(df, min_support=3)
     assert "prior_5d_return" in promoted  # 4 >= 3
     assert "entry_rsi14" not in promoted  # 2 < 3
-    assert set(_MARKET_KEY_MAP) == {"china_a", "us", "hk", "crypto"}
+    assert set(_MARKET_KEY_MAP) == {"china_a", "us", "hk", "uk", "crypto"}
+    assert _MARKET_KEY_MAP["uk"] == "uk_equity"
 
 
 @pytest.mark.unit
