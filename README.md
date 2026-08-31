@@ -557,7 +557,7 @@ run from a clone (`pip install -e .`).
 </details>
 
 <details>
-<summary><b>Broker Connectors</b> <sub>13 brokers — read + paper, bounded-live where supported</sub></summary>
+<summary><b>Broker Connectors</b> <sub>14 brokers — read + paper, bounded-live where supported</sub></summary>
 
 Connector-first profiles. Most do read + paper-account order placement — IBKR is read-only, Robinhood is live-only (no paper account), and Trading 212 refuses order placement entirely, paper included; live order placement is bounded by a user-defined mandate (symbol allowlist, order-size / exposure caps, daily trade cap, instant kill switch) and never holds funds — the broker executes. Order-placing tools stay off MCP (agent + CLI only). Research / backtest paths are structurally barred from any live endpoint.
 
