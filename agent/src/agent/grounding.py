@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from src.market_data import canonical_fx_pair
 
 
 GROUNDING_ARTIFACT = "grounding_evidence.json"
@@ -160,6 +161,7 @@ _CANONICAL_SYMBOL_RE = re.compile(
     r"\d{3,6}\.(?:SH|SZ|BJ|SS|HK|KS|KQ)|"
     r"[A-Z][A-Z0-9&.-]{0,19}\.(?:US|NS|BO|FX|TO|V)|"
     r"[A-Z0-9]{2,15}(?:-|/)(?:USDT|USDC|USD|BTC|ETH)|"
+    r"\^[A-Z0-9&.\-]{1,20}|"
     r"[A-Z0-9]{2,15}=[FX]"
     r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
@@ -570,9 +572,19 @@ def _normalize_symbol(value: Any) -> str:
         Kong code zero-padded, and a crypto pair hyphenated. Text that is not a
         symbol is returned uppercased and otherwise untouched.
     """
-    symbol = str(value or "").strip().upper().replace("/", "-")
+    # A fiat/fiat pair is one FX instrument regardless of spelling: ``GBP/USD``
+    # and ``GBPUSD`` are both ``GBPUSD=X``. Checked BEFORE the slash is
+    # rewritten ("GBP/USD" -> "GBP-USD", the crypto-pair spelling), which
+    # disagreed with the resolver's ``GBPUSD=X`` answer — a contradictory
+    # identity that outranked every later lock and blocked all further tools.
+    raw = str(value or "").strip().upper()
+    fx = canonical_fx_pair(raw)
+    if fx is not None:
+        return fx
+    symbol = raw.replace("/", "-")
     if not symbol:
         return ""
+
     prefixed = _EXCHANGE_PREFIXED_RE.match(symbol)
     if prefixed:
         return f"{prefixed.group(2)}.{prefixed.group(1)}"
@@ -824,6 +836,10 @@ def _infer_currency(symbol: str) -> str | None:
             quote = upper.rsplit(separator, 1)[-1]
             if 3 <= len(quote) <= 5:
                 return quote
+    if upper.endswith("=X"):
+        pair = upper[:-2]
+        if len(pair) == 6:
+            return pair[3:6]
     return None
 
 
@@ -840,6 +856,8 @@ def _infer_instrument_type(symbol: str, candidate_type: Any = None) -> str:
         return "option"
     if "forex" in raw or raw == "currency":
         return "forex"
+    if "index" in raw:
+        return "index"
     upper = _normalize_symbol(symbol)
     if upper.endswith("=F"):
         return "future"
@@ -847,6 +865,8 @@ def _infer_instrument_type(symbol: str, candidate_type: Any = None) -> str:
         return "forex"
     if "-" in upper or "/" in upper:
         return "crypto"
+    if upper.startswith("^"):
+        return "index"
     return "listed_security"
 
 

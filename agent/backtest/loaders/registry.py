@@ -164,7 +164,94 @@ FALLBACK_CHAINS: dict[str, list[str]] = {
     # mt5 leads when a local MetaTrader 5 terminal is attached (Windows-only,
     # broker feed); otherwise it reports unavailable and the chain proceeds.
     "forex":     ["mt5", "akshare", "yfinance", "local"],
+    # Yahoo index symbols (^SPX, ^NDX, ^FTSE, ^VIX, ...): served verbatim by
+    # the public chart endpoint, same as the =F/=X conventions.
+    "index":     ["yahoo", "yfinance", "local"],
 }
+
+
+# ---------------------------------------------------------------------------
+# Price caliber: what the served prices actually mean, per source (#1301)
+# ---------------------------------------------------------------------------
+
+#: A value lands here only when it is measured against live payloads (the
+#: #1301 chain table) or pinned by the loader's own endpoint/parameter
+#: choice. Anything unverified resolves to "unknown" on purpose: origin-side
+#: adjustment is invisible from loader code (yahoo serves split-adjusted
+#: quotes with zero adjustment logic in this repo), so an unmeasured source
+#: must say "unknown" rather than a guessed caliber.
+PRICE_CALIBER_BY_SOURCE: dict[str, str] = {
+    # Split- and dividend-adjusted.
+    "yahoo": "split_dividend",  # quote series split-adjusted at origin, scaled to adjclose
+    "yfinance": "split_dividend",  # auto_adjust=True
+    "eastmoney": "split_dividend",  # fqt=1 (forward-adjusted) on every kline call
+    "tencent": "split_dividend",  # fqkline qfq
+    "akshare": "split_dividend",  # adjust="qfq", including the stock_us_hist path
+    "baostock": "split_dividend",  # adjustflag="2"
+    "tushare": "split_dividend",  # adj_factor applied via cn_adjust (A-share/fund)
+    # Split-adjusted only.
+    "pykrx": "split",  # get_market_ohlcv_by_date(adjusted=True), Naver-backed
+    # Unadjusted.
+    "sina": "raw",
+    "tiingo": "raw",  # fetches adjusted columns and deliberately drops them
+    "fmp": "raw",  # historical-price-full only, never the adjusted variant
+    "alphavantage": "raw",  # TIME_SERIES_DAILY, not the _ADJUSTED endpoint
+    "longbridge": "raw",  # pins AdjustType.NoAdjust
+}
+
+#: Per-(source, market) exceptions to the per-source table.
+PRICE_CALIBER_BY_SOURCE_MARKET: dict[tuple[str, str], str] = {
+    # Tushare publishes no HK adjustment-factor series, so its HK path is raw.
+    ("tushare", "hk_equity"): "raw",
+}
+
+#: Markets with no corporate-action adjustment concept. Their sources stamp
+#: "na" and stay out of mixed-caliber comparisons.
+_NA_CALIBER_MARKETS = frozenset({"crypto", "forex", "futures", "macro"})
+
+#: Calibers that participate in mixed-caliber comparison. "unknown" and "na"
+#: never do: the first is unmeasured, the second has nothing to adjust for.
+_COMPARABLE_CALIBERS = frozenset({"raw", "split", "split_dividend"})
+
+
+def price_caliber(source: str, market: str | None = None) -> str:
+    """Return the adjustment caliber of ``source``'s served prices.
+
+    One of "raw", "split", "split_dividend", "na" (a market without
+    corporate actions), or "unknown" (an unmeasured source).
+    """
+    if market in _NA_CALIBER_MARKETS:
+        return "na"
+    return PRICE_CALIBER_BY_SOURCE_MARKET.get(
+        (source, market), PRICE_CALIBER_BY_SOURCE.get(source, "unknown")
+    )
+
+
+def mixed_caliber_warning(stamps: dict[str, tuple[str, str]]) -> str | None:
+    """Build the mixed-caliber warning for a served basket, or None.
+
+    ``stamps`` maps each served symbol to the (source, caliber) pair that
+    served it. Fires only when at least two distinct comparable calibers are
+    present; "unknown" and "na" entries never trigger it.
+    """
+    by_caliber: dict[str, list[str]] = {}
+    for symbol, (_source, caliber) in stamps.items():
+        if caliber in _COMPARABLE_CALIBERS:
+            by_caliber.setdefault(caliber, []).append(symbol)
+    if len(by_caliber) < 2:
+        return None
+    parts = []
+    for caliber, symbols in sorted(by_caliber.items()):
+        shown = ", ".join(sorted(symbols)[:4])
+        if len(symbols) > 4:
+            shown += f", +{len(symbols) - 4} more"
+        parts.append(f"{caliber} ({shown})")
+    return (
+        "mixed price calibers in this run: " + "; ".join(parts) + ". "
+        "Prices are not on the same scale across calibers, so cross-symbol "
+        "comparisons (momentum ranks, relative performance) are biased. "
+        "See the adjustment field of each symbol's provenance entry."
+    )
 
 
 # ---------------------------------------------------------------------------

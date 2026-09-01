@@ -38,6 +38,9 @@ _SOURCE_PATTERNS = [
     # China-market loaders that cannot resolve them.
     (re.compile(r"^[A-Z0-9]+=F$", re.I), "yahoo"),
     (re.compile(r"^[A-Z]+=X$", re.I), "yahoo"),
+    # Yahoo index symbols (^SPX, ^GSPC, ^FTSE, ^VIX, ...) — served verbatim,
+    # same convention as =F/=X. Without this they fell to the tushare default.
+    (re.compile(r"^\^[A-Za-z0-9.\-]+$", re.I), "yahoo"),
     # Korea: KOSPI (005930.KS) / KOSDAQ (247540.KQ), 6-digit codes. Served by
     # pykrx (KRX public data, no auth); registry falls back to Yahoo/yfinance.
     (re.compile(r"^\d{6}\.(KS|KQ)$", re.I), "pykrx"),
@@ -60,11 +63,51 @@ def detect_source(code: str) -> str:
     return "tushare"
 
 
+
 def get_loader(source: str):
     """Get loader class via registry with fallback support."""
     from backtest.loaders.registry import get_loader_cls_with_fallback
 
     return get_loader_cls_with_fallback(source)
+
+
+#: ISO-4217-style fiat codes. A pair whose BOTH legs are fiat is an FX pair,
+#: never a crypto instrument — ``GBP/USD`` used to be classified as the crypto
+#: pair "GBP-USD" (its quote leg USD is a crypto-connector quote asset) by the
+#: symbol-search tool's pair classifier and by the grounding ledger's symbol
+#: scanner, which then disagreed with the search result ("GBPUSD=X") and made
+#: the identity gate flag a conflict. One canonicalization is shared here so
+#: search, fetch and grounding all agree.
+FIAT_CODES = frozenset(
+    {
+        "USD", "EUR", "GBP", "JPY", "CHF", "CNY", "CNH", "HKD", "AUD", "NZD",
+        "CAD", "KRW", "INR", "SGD", "SEK", "NOK", "DKK", "MXN", "BRL", "ZAR",
+        "TRY", "RUB", "PLN", "THB", "MYR", "IDR", "PHP", "VND", "ILS", "AED",
+        "SAR", "EGP", "CZK", "HUF", "RON", "CLP", "COP", "PEN", "TWD", "CUP",
+    }
+)
+
+#: Yahoo-served FX pair symbol forms, canonicalized to ``XXXYYY=X``.
+_FX_PAIR_RE = re.compile(r"^(?P<base>[A-Z]{3})(?:/)?(?P<quote>[A-Z]{3})$", re.IGNORECASE)
+
+
+def canonical_fx_pair(value: str) -> str | None:
+    """Return a Yahoo FX pair in canonical ``XXXYYY=X`` form, or ``None``.
+
+    Recognizes ``GBP/USD``, ``GBPUSD`` and ``GBPUSD=X`` (both legs must be
+    fiat codes — ``ETH/USD`` and ``XAU/USD`` are not FX pairs) and returns
+    the canonical spelling the market-data fetch layer serves directly.
+    """
+    clean = str(value or "").strip().upper()
+    if clean.endswith("=X"):
+        clean = clean[:-2]
+    matched = _FX_PAIR_RE.fullmatch(clean)
+    if not matched:
+        return None
+    base, quote = matched.group("base"), matched.group("quote")
+    if base not in FIAT_CODES or quote not in FIAT_CODES:
+        return None
+    return f"{base}{quote}=X"
 
 
 # Canadian venue-alias helper: TSX (.TO) <-> TSX Venture (.V).
@@ -158,6 +201,7 @@ def fetch_market_data(
         FALLBACK_CHAINS,
         _NO_NETWORK_FALLBACK_SOURCES,
         get_source_order_override,
+        price_caliber,
         refresh_source_order_overrides,
     )
 
@@ -321,6 +365,7 @@ def fetch_market_data(
                 "fallback_used": bool(used_source and used_source != src),
                 "currency_conversion": currency_conversion,
                 "volume_unit": volume_units.get(market),
+                "adjustment": price_caliber(used_source or src, market),
             }
             quote_currency = frame_attrs.get("quote_currency")
             if isinstance(quote_currency, str) and quote_currency:
@@ -381,6 +426,7 @@ def fetch_market_data(
                         "fallback_used": True,
                         "currency_conversion": "none",
                         "volume_unit": base.get("volume_unit"),
+                        "adjustment": base.get("adjustment", price_caliber(src, market)),
                         "venue_fallback": True,
                         "resolved_symbol": sibling,
                     }

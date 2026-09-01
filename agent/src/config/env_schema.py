@@ -233,6 +233,7 @@ class DataConfig(_EnvBase):
     market_data_order_fund: str = Field(alias="MARKET_DATA_ORDER_FUND", default="")
     market_data_order_macro: str = Field(alias="MARKET_DATA_ORDER_MACRO", default="")
     market_data_order_forex: str = Field(alias="MARKET_DATA_ORDER_FOREX", default="")
+    market_data_order_index: str = Field(alias="MARKET_DATA_ORDER_INDEX", default="")
 
 
 # ---------------------------------------------------------------------------

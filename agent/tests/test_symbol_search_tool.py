@@ -762,3 +762,69 @@ class TestCryptoPairWithoutABrokerConnection:
         ), patch.object(ss.yahoo_client, "search", return_value=[]):
             ss.SymbolSearchTool().execute(query="apple", limit=5)
         assert called == []
+
+
+# --------------------------------------------------------------------------
+# FX pairs + index symbols: search and fetch must agree on the symbol universe
+# --------------------------------------------------------------------------
+
+
+class TestFxPairAlignment:
+    """search_symbol must resolve FX pairs and return fetch-able symbols."""
+
+    def test_canonical_fx_pair_spellings(self) -> None:
+        assert ss._canonical_fx_pair("GBP/USD") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("gbp/usd") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("GBPUSD") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("GBPUSD=X") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("USD/JPY") == "USDJPY=X"
+        assert ss._canonical_fx_pair("GBPCNY") == "GBPCNY=X"
+        # Not pairs / not fiat-fiat
+        assert ss._canonical_fx_pair("BRK-B") is None
+        assert ss._canonical_fx_pair("AAPL") is None
+        assert ss._canonical_fx_pair("ETH/USD") is None  # crypto, not FX
+        assert ss._canonical_fx_pair("XAU/USD") is None  # metal, not fiat
+
+    def test_fiat_pairs_are_not_misclassified_as_crypto(self) -> None:
+        """GBP/USD must stop being treated as a crypto 'GBP-USD' pair."""
+        assert ss._canonical_crypto_pair("GBP/USD") is None
+        assert ss._canonical_crypto_pair("EURUSD") is None
+        # Crypto classifications must remain untouched.
+        assert ss._canonical_crypto_pair("ETH/USD") == "ETH-USD"
+        assert ss._canonical_crypto_pair("BTC/USDT") == "BTC-USDT"
+        assert ss._canonical_crypto_pair("BTCUSDT") == "BTC-USDT"
+
+    def test_fx_query_returns_canonical_candidate_when_yahoo_unavailable(self) -> None:
+        """A throttled/failed Yahoo must not turn a canonical pair into nothing."""
+        with patch.object(
+            ss.yahoo_client, "search", side_effect=Exception("Too Many Requests")
+        ), patch.object(
+            ss.eastmoney_client, "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.sec_edgar_client, "cik_for", return_value=""):
+            out = json.loads(ss.SymbolSearchTool().execute(query="GBP/USD", limit=5))
+
+        by_symbol = {c["symbol"]: c for c in out["data"]["candidates"]}
+        assert "GBPUSD=X" in by_symbol
+        assert by_symbol["GBPUSD=X"]["market"] == "fx"
+        assert by_symbol["GBPUSD=X"]["type"] == "currency"
+
+    def test_from_yahoo_symbol_normalizes_currency_quotes(self) -> None:
+        assert ss._from_yahoo_symbol("GBP/USD", {"quoteType": "CURRENCY"}) == (
+            "GBPUSD=X",
+            "fx",
+        )
+        assert ss._from_yahoo_symbol("GBPUSD=X", {"quoteType": "CURRENCY"}) == (
+            "GBPUSD=X",
+            "fx",
+        )
+
+    def test_from_yahoo_symbol_labels_indexes(self) -> None:
+        assert ss._from_yahoo_symbol("^SPX", {"quoteType": "INDEX"}) == (
+            "^SPX",
+            "index",
+        )
+        assert ss._from_yahoo_symbol("^FTSE", {"quoteType": "INDEX"}) == (
+            "^FTSE",
+            "index",
+        )

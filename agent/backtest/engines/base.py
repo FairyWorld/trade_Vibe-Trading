@@ -1079,6 +1079,9 @@ class BaseEngine(ABC):
         )
 
         # 9. Trust Layer run card
+        card_warnings = list(config.get("content_filter_warnings") or [])
+        if config.get("_run_card_caliber_warning"):
+            card_warnings.append(config["_run_card_caliber_warning"])
         from backtest.run_card import write_run_card
         write_run_card(
             run_dir,
@@ -1086,7 +1089,7 @@ class BaseEngine(ABC):
             m,
             data_sources=_run_card_data_sources(config, loader),
             strategy_path=run_dir / "code" / "signal_engine.py",
-            warnings=config.get("content_filter_warnings") or None,
+            warnings=card_warnings or None,
         )
 
         # Print scalar metrics (skip nested dicts for JSON compat).

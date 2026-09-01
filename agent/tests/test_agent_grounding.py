@@ -2471,3 +2471,105 @@ def test_a_us_csv_stem_resolves_to_its_venue_suffix() -> None:
     assert _symbol_from_csv_filename("GC_F") == "GC=F"
     # A bare name has no venue suffix and must stay unresolvable.
     assert _symbol_from_csv_filename("AAPL") is None
+
+
+class TestFiatPairAndIndexNormalization:
+    """Search, fetch and grounding agree on one FX spelling; ^ is a symbol."""
+
+    def test_fiat_pair_spellings_normalize_to_yahoo_form(self) -> None:
+        from src.agent.grounding import _normalize_symbol
+
+        assert _normalize_symbol("GBP/USD") == "GBPUSD=X"
+        assert _normalize_symbol("GBPUSD") == "GBPUSD=X"
+        assert _normalize_symbol("GBPUSD=X") == "GBPUSD=X"
+        # Crypto/metals keep their pair form — not fiat/fiat FX.
+        assert _normalize_symbol("ETH/USD") == "ETH-USD"
+        assert _normalize_symbol("XAU/USD") == "XAU-USD"
+
+    def test_scanned_slashed_pair_matches_resolver_answer(self) -> None:
+        """The query-as-asserted scan must agree with the chosen candidate."""
+        from src.agent.grounding import _scan_symbols
+
+        assert _scan_symbols("use GBP/USD spot") == {"GBPUSD=X"}
+
+    def test_index_symbols_are_scanned_and_typed(self) -> None:
+        from src.agent.grounding import (
+            _infer_currency,
+            _infer_instrument_type,
+            _scan_symbols,
+        )
+
+        assert _scan_symbols("quote ^SPX") == {"^SPX"}
+        assert _infer_instrument_type("^SPX", "INDEX") == "index"
+        assert _infer_instrument_type("^SPX") == "index"
+        assert _infer_currency("GBPUSD=X") == "USD"
+
+    def test_ingest_search_symbol_does_not_create_conflicting_identity(self) -> None:
+        """The flagship regression: ingest('GBP/USD') must lock, never conflict."""
+        from src.agent.grounding import _normalize_symbol
+
+        # Chosen (from search_symbol) and asserted (the query text) must be
+        # the same canonical identity — the comparison in _ingest_resolution.
+        chosen = _normalize_symbol("GBPUSD=X")
+        asserted = _scan_symbols("GBP/USD")
+        assert chosen in asserted
+
+
+def test_fx_pair_resolution_authorizes_market_data_consumer(tmp_path: Path) -> None:
+    """Issue: search_symbol('GBP/USD') must lock, and get_market_data('GBPUSD=X')
+    must be authorized — the slashed query used to normalize to the crypto
+    spelling (GBP-USD), disagreeing with the chosen GBPUSD=X candidate and
+    creating a conflicting identity that outranked every later lock.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Get me the GBP/USD spot rate.",
+    )
+    before_resolution = ledger.authorized_symbols
+    resolver = ledger.authorize_tool_call(
+        "search_symbol",
+        {"query": "GBP/USD"},
+        batch_authorized_symbols=before_resolution,
+        call_id="resolve-fx",
+    )
+    assert resolver.allowed is True
+
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "GBP/USD"},
+        result=json.dumps(
+            {
+                "ok": True,
+                "source": "symbol_search",
+                "data": {
+                    "query": "GBP/USD",
+                    "count": 1,
+                    "sources": {"yahoo": "ok", "fx_normalizer": "ok"},
+                    "candidates": [
+                        {
+                            "symbol": "GBPUSD=X",
+                            "name": "GBP/USD",
+                            "market": "fx",
+                            "type": "currency",
+                            "exchange": "CCY",
+                            "source": "fx_normalizer",
+                        },
+                    ],
+                },
+            }
+        ),
+        call_id="resolve-fx",
+        success=True,
+    )
+
+    authorization = ledger.authorize_tool_call(
+        "get_market_data",
+        {"codes": ["GBPUSD=X"]},
+        batch_authorized_symbols=ledger.authorized_symbols,
+        batch_identity_status=ledger.identity_status,
+        call_id="fx-prices",
+    )
+
+    assert ledger.identity_status == "locked"
+    assert ledger.authorized_symbols == {"GBPUSD=X"}
+    assert authorization.allowed is True

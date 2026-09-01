@@ -31,6 +31,11 @@ from typing import Any, Dict, List, Optional
 
 from backtest.loaders import eastmoney_client, sec_edgar_client, yahoo_client
 from src.agent.tools import BaseTool
+from src.market_data import FIAT_CODES, canonical_fx_pair
+
+# Back-compat alias: the search tool's historical name for the shared
+# fiat-pair canonicalizer (search, fetch and grounding share one definition).
+_canonical_fx_pair = canonical_fx_pair
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +206,27 @@ class SymbolSearchTool(BaseTool):
         em_hits, sources["eastmoney"] = _search_eastmoney(query)
         candidates.extend(em_hits)
 
-        yh_hits, sources["yahoo"] = _search_yahoo(query)
+        # An explicit FX pair searches Yahoo by its canonical ``XXXYYY=X``
+        # spelling — exact-symbol search is far more reliable than free text —
+        # and always yields a deterministic candidate, so a throttled/outage
+        # Yahoo (the earlier "GBP/USD -> 0 candidates" failure) never turns a
+        # canonical pair into nothing.
+        fx_pair = _canonical_fx_pair(query)
+        yh_hits, sources["yahoo"] = _search_yahoo(fx_pair or query)
         candidates.extend(yh_hits)
+        if fx_pair is not None:
+            pair_no_x = fx_pair[:-2]
+            candidates.append(
+                {
+                    "symbol": fx_pair,
+                    "name": f"{pair_no_x[:3]}/{pair_no_x[3:]}",
+                    "market": "fx",
+                    "type": "currency",
+                    "exchange": "CCY",
+                    "source": "fx_normalizer",
+                }
+            )
+            sources["fx_normalizer"] = "ok"
 
         if crypto_pair is not None:
             # A pair query is an exact instrument assertion. Near-string Yahoo
@@ -279,11 +303,17 @@ def _canonical_crypto_pair(value: str) -> str | None:
     clean = str(value or "").strip().upper()
     matched = _CRYPTO_PAIR_RE.fullmatch(clean)
     if matched:
-        return f"{matched.group(1)}-{matched.group(2)}"
+        base, quote = matched.group(1), matched.group(2)
+        if base in FIAT_CODES and quote in FIAT_CODES:
+            return None  # fiat/fiat is an FX pair, not crypto
+        return f"{base}-{quote}"
     if clean.isalnum():
         for quote in _CRYPTO_QUOTE_ASSETS:
             if clean.endswith(quote) and len(clean) > len(quote) + 1:
-                return f"{clean[: -len(quote)]}-{quote}"
+                base = clean[: -len(quote)]
+                if base in FIAT_CODES and quote in FIAT_CODES:
+                    return None  # fiat/fiat is an FX pair, not crypto
+                return f"{base}-{quote}"
     return None
 
 
@@ -667,6 +697,16 @@ def _from_yahoo_symbol(raw_symbol: str, quote: Dict[str, Any]) -> tuple[str, str
     if upper.endswith((".SH", ".SZ", ".BJ")):
         return upper, "cn"
     quote_type = str(quote.get("quoteType") or "").strip().upper()
+    if quote_type == "CURRENCY":
+        # FX pairs canonicalize to the ``XXXYYY=X`` form the fetch layer
+        # serves directly (``GBP/USD`` -> ``GBPUSD=X``); non-fiat currency
+        # quotes (metals like XAU/USD) keep their native symbol.
+        canon = _canonical_fx_pair(raw_symbol)
+        if canon is not None:
+            return canon, "fx"
+        return raw_symbol, "global"
+    if raw_symbol.startswith("^"):
+        return raw_symbol, "index"
     if quote_type == "EQUITY" and "." not in raw_symbol and "-" not in raw_symbol:
         return f"{upper}.US", "us"
     # Crypto, indices, FX, ETFs on non-HK exchanges: keep Yahoo's native symbol.

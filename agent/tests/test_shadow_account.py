@@ -423,7 +423,7 @@ def test_run_shadow_backtest_handles_runner_failure(
 
     from src.shadow_account.backtester import load_cached_result
 
-    cached = load_cached_result(profile.shadow_id)
+    cached = load_cached_result(profile, window_start="2026-01-01", window_end="2026-06-30")
     assert cached is not None
     assert cached.shadow_total_pnl is None
     assert cached.delta_pnl is None
@@ -488,7 +488,7 @@ def test_run_shadow_backtest_derives_pnl_from_final_value(
 
     from src.shadow_account.backtester import load_cached_result
 
-    cached = load_cached_result(profile.shadow_id)
+    cached = load_cached_result(profile, window_start="2026-01-01", window_end="2026-06-30")
     assert cached is not None
     assert cached.shadow_total_pnl == pytest.approx(-165_858.20, abs=0.01)
     assert cached.delta_pnl == result.delta_pnl
@@ -621,7 +621,9 @@ def test_run_shadow_backtest_runs_once_per_currency(
     for call in calls:
         currencies = {code_currency(c) for c in call["codes"]}  # type: ignore[union-attr]
         assert len(currencies) == 1
-    assert (runs_dir(profile.shadow_id) / "shadow_result.json").exists()
+    from src.shadow_account.backtester import _cache_key
+    digest = _cache_key(profile, "2026-01-01", "2026-06-30")
+    assert (runs_dir(profile.shadow_id) / f"shadow_result_{digest}.json").exists()
     assert set(result.per_market.keys()) == {"china_a", "hk", "us", "crypto"}
 
 

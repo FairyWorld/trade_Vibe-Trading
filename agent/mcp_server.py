@@ -1795,6 +1795,12 @@ def get_market_data(
     single shares). Each symbol's ``_provenance.volume_unit`` states the unit
     of the returned rows ("lots" / "shares"; null = source undeclared) — read
     it before interpreting or comparing volume values across symbols/sources.
+
+    Price caliber: which source served a symbol decides what its prices mean
+    (some adjust for splits and dividends, others serve raw quotes). Each
+    symbol's ``_provenance.adjustment`` states the caliber ("raw" / "split" /
+    "split_dividend" / "na" / "unknown") — read it before comparing price
+    levels across symbols.
     """
     registry = _get_registry()
     return registry.execute(

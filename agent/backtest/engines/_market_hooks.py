@@ -57,6 +57,14 @@ _MARKET_PATTERNS = [
     # Forex pairs: XXX/YYY or XXXXXX.FX
     (re.compile(r"^[A-Z]{3}/[A-Z]{3}$"), "forex"),
     (re.compile(r"^[A-Z]{6}\.FX$"), "forex"),
+    # Yahoo forex suffix convention (EURUSD=X, GBPCNY=X) — served verbatim by
+    # the chart endpoint. Without this rule such symbols fell through to the
+    # a_share default (misrouting composite/market classification).
+    (re.compile(r"^[A-Z]{3,6}=X$"), "forex"),
+    # Yahoo index symbols (^SPX, ^NDX, ^FTSE, ^VIX, ...) — served verbatim,
+    # same as the =F/=X conventions. Classified as their own market so they
+    # never route through an equity/China chain or a cash currency.
+    (re.compile(r"^\^[A-Za-z0-9.\-]+$"), "index"),
     # Bare US tickers (AAPL, MSFT, SPY, T, ...). Must stay LAST so every
     # suffixed equity / futures / crypto / forex form above wins first.
     # ``{1,5}`` covers every standard US ticker length while 6-char bare
@@ -116,6 +124,8 @@ def code_currency(code: str) -> str:
         pair = code.upper().replace("/", "")
         if pair.endswith(".FX"):
             pair = pair[:-3]
+        if pair.endswith("=X"):
+            pair = pair[:-2]
         return pair[3:6] if len(pair) == 6 else "UNKNOWN:forex"
     if market == "futures":
         if _is_china_futures(code):
@@ -225,6 +235,19 @@ _TIER_TABLE = [
 FUNDING_HOURS = {0, 8, 16}
 
 
+def _interval_span_hours(interval: str) -> float | None:
+    """Bar span in hours for a runner interval token, ``None`` when unknown.
+
+    The runner accepts only 1m/5m/15m/30m/1H/4H/1D, so ``m`` is minutes here
+    (there is no monthly token to confuse it with).
+    """
+    token = str(interval).strip()
+    for suffix, scale in (("m", 1 / 60), ("H", 1.0), ("D", 24.0)):
+        if token.endswith(suffix) and token[: -len(suffix)].isdigit():
+            return int(token[: -len(suffix)]) * scale
+    return None
+
+
 def _maintenance_rate(notional_usd: float) -> float:
     """Look up tiered maintenance margin rate."""
     for tier_max, rate in _TIER_TABLE:
@@ -241,6 +264,7 @@ def calc_crypto_funding_fee(
     funding_rate: float,
     applied_set: set,
     daily_done_set: set,
+    bar_span_hours: float | None = None,
 ) -> float:
     """Calculate crypto funding fee for one symbol.
 
@@ -253,6 +277,12 @@ def calc_crypto_funding_fee(
             carries no historical ``funding_rate`` column.
         applied_set: (symbol, date, hour) dedup set — mutated.
         daily_done_set: (symbol, date) dedup set — mutated.
+        bar_span_hours: Bar span in hours when known. At 8h or wider the
+            settlement count comes from the span (``max(1, span // 8)`` per
+            bar), because a daily bar can never land on the 8h/16h slots:
+            without this a daily-bar run charges a third of the documented
+            funding model (#1290). Narrower bars keep the slot logic below
+            unchanged.
 
     Returns:
         Fee amount (positive = longs pay, negative = longs receive).
@@ -263,7 +293,14 @@ def calc_crypto_funding_fee(
     current_date = timestamp.date()
     hour = timestamp.hour if hasattr(timestamp, "hour") else 0
 
-    if hour in FUNDING_HOURS:
+    settlements = 1
+    if bar_span_hours is not None and bar_span_hours >= 8:
+        settlements = max(1, int(bar_span_hours // 8))
+        key = (symbol, current_date, hour)
+        if key in applied_set:
+            return 0.0
+        applied_set.add(key)
+    elif hour in FUNDING_HOURS:
         key = (symbol, current_date, hour)
         if key in applied_set:
             return 0.0
@@ -286,7 +323,24 @@ def calc_crypto_funding_fee(
     hist = bar.get("funding_rate")
     if hist is not None and pd.notna(hist):
         funding_rate = float(hist)
-    return notional * funding_rate * pos.direction
+    return notional * funding_rate * pos.direction * settlements
+
+
+def _liquidation_mark(bar: pd.Series, pos: Position) -> float:
+    """Adverse price the liquidation check and the fill both use.
+
+    Bar high for a short, low for a long -- mirroring the strict path's
+    "adverse" convention (perpetual_risk._mark_price) -- falling back to the
+    close, then the entry price, for bars without high/low. Detection and
+    execution share the same mark so a wick trigger never fills at a better
+    price than the venue that liquidated it.
+    """
+    mark_price = bar.get("high" if pos.direction < 0 else "low")
+    if mark_price is None or pd.isna(mark_price):
+        mark_price = bar.get("close")
+    if mark_price is None or pd.isna(mark_price):
+        mark_price = pos.entry_price
+    return float(mark_price)
 
 
 def check_crypto_liquidation(
@@ -296,20 +350,17 @@ def check_crypto_liquidation(
 ) -> bool:
     """Check if a crypto position should be liquidated.
 
-    Args:
-        symbol: Instrument code.
-        bar: Current bar data.
-        positions: Shared positions dict.
-
-    Returns:
-        True if liquidation should be triggered.
-        Does NOT execute the liquidation -- caller handles that.
+    Fires when equity in the position (margin + unrealized) falls at or below
+    the maintenance margin, marked at the adverse extremum so an intra-bar
+    wick counts. A 1x long is exempt because its bankruptcy price is zero; a
+    1x short is not -- margin is the full notional and a 2x adverse move
+    zeroes it. Does NOT execute the liquidation -- the caller handles that.
     """
     pos = positions.get(symbol)
-    if pos is None or pos.leverage <= 1.0:
+    if pos is None or (pos.leverage <= 1.0 and pos.direction > 0):
         return False
 
-    mark_price = float(bar.get("close", pos.entry_price))
+    mark_price = _liquidation_mark(bar, pos)
     margin = pos.size * pos.entry_price / pos.leverage
     unrealized = pos.direction * pos.size * (mark_price - pos.entry_price)
 
