@@ -2788,3 +2788,176 @@ def test_fx_pair_resolution_authorizes_market_data_consumer(tmp_path: Path) -> N
     assert ledger.identity_status == "locked"
     assert ledger.authorized_symbols == {"GBPUSD=X"}
     assert authorization.allowed is True
+
+
+def test_backtest_metrics_rejected_when_analysis_tool_failed(
+    tmp_path: Path,
+) -> None:
+    """#1336: failed analysis tools cannot ground backtest-style metrics."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几支标的并回测不同市场状态",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": "runs/compare"},
+        result=(
+            '{"status": "error", "error": "market data unavailable after dedup"}'
+        ),
+        call_id="bt-failed",
+        success=False,
+    )
+
+    bad = ledger.validate_final_answer(
+        "| 策略 | Return vol | MaxDD | Prob. of hitting target |\n"
+        "|---|---:|---:|---:|\n"
+        "| M1 | 12.4% | -8.1% | 55% |"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_backtest_metrics_rejected_when_no_analysis_result(
+    tmp_path: Path,
+) -> None:
+    """#1336: without any completed analysis, metric prose is unsupported."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几个标的的历史行情",
+    )
+
+    bad = ledger.validate_final_answer(
+        "历史回测显示策略年化波动率约 18.2%，最大回撤 -9.4%，"
+        "夏普比率 1.21，命中目标概率 58%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_backtest_metrics_accepted_after_successful_backtest(
+    tmp_path: Path,
+) -> None:
+    """#1336: a genuinely completed backtest grounds the same figures."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几支标的并回测不同市场状态",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": "runs/compare"},
+        result=(
+            '{"exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": '
+            '["metrics.csv"], "run_dir": "runs/compare"}'
+        ),
+        call_id="bt-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "| 策略 | Return vol | MaxDD | Prob. of hitting target |\n"
+        "|---|---:|---:|---:|\n"
+        "| M1 | 12.4% | -8.1% | 55% |"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_analysis_mention_without_figures_is_allowed(tmp_path: Path) -> None:
+    """#1336: refusal prose naming the gap is not a quantitative claim."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="回测这几个标的",
+    )
+
+    good = ledger.validate_final_answer(
+        "回测未能完成（行情数据不可用），因此无法给出波动率或回撤数据。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_metrics_from_successful_numeric_tool_are_allowed(
+    tmp_path: Path,
+) -> None:
+    """A successful generic analysis result grounds its returned metrics.
+
+    The real tool returns fractions (annualized_vol 0.182, max_drawdown
+    -0.094) while answers quote percents — the unit scaling must match.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="分析组合风险",
+    )
+    ledger.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {
+                    "volatility": {"annualized_vol": 0.182},
+                    "drawdown": {"max_drawdown": -0.094},
+                    "sharpe": 1.21,
+                },
+            }
+        ),
+        call_id="risk-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "组合年化波动率 18.2%，最大回撤 -9.4%，夏普比率 1.21。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_partially_unsupported_analysis_metrics_are_rejected(
+    tmp_path: Path,
+) -> None:
+    """One observed metric cannot launder another invented metric."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="分析组合风险",
+    )
+    ledger.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {"volatility": {"annualized_vol": 0.182}},
+            }
+        ),
+        call_id="risk-partial",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "组合年化波动率 18.2%，最大回撤 -9.4%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_forecast_probability_is_not_a_measured_claim(tmp_path: Path) -> None:
+    """#1336 gates measured facts, not forward-looking forecasts."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="明天市场会怎么样",
+    )
+
+    good = ledger.validate_final_answer(
+        "预计明日上涨概率 70%，波动率可能放大。"
+    )
+
+    assert good.valid is True, good.issues

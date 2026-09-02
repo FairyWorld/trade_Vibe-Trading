@@ -42,6 +42,13 @@ from src.agent.resolution_context import (
 GROUNDING_ARTIFACT = "grounding_evidence.json"
 
 _RESOLVER_TOOL = "search_symbol"
+
+# Tools whose successful completion grounds backtest/analysis metric claims
+# (#1336). A deduplicated ("skipped") call also counts: the loop only skips a
+# call that already completed successfully, and its result lives in the run.
+_ANALYSIS_TOOLS = frozenset(
+    {"backtest", "factor_analysis", "run_shadow_backtest", "quantlib_call"}
+)
 _PRIVATE_COMPANY_SKILL_NAMES = {
     "private-company",
     "private-company-analysis",
@@ -229,6 +236,31 @@ _PRICE_CONTEXT_RE = re.compile(
     # exactly the way "closed at" did in English.
     r"成交价|最新价|股价|收报|"
     r"现价|报价|价格|价位)",
+    re.IGNORECASE,
+)
+_ANALYSIS_METRIC_RE = re.compile(
+    r"(?:\breturn vol(?:atility)?\b|\bmax(?: |\.)?drawdown\b|\bmaxdd\b|"
+    r"\bsharpe(?: ratio)?\b|\bwin rate\b|\bhit rate\b|"
+    r"\bprob(?:ability)?\.?\s+of\b|\bvolatility\b|\bdrawdown\b|"
+    r"\bannualiz\w*\b|\bwindow(?:s)?\b|\bregime(?:s)?\b|"
+    r"夏普|回撤|波动率|胜率|命中率|概率|年化|回测|窗口)",
+    re.IGNORECASE,
+)
+# Measurement-shaped numbers for analysis claims: keeps the % sign and sign
+# (unlike _numbers_without_dates_or_percent, which drops percentages on
+# purpose). A bare integer is NOT a measurement — "252 个交易日年化" is the
+# standard convention, not a claim about this run's analysis (#1032-style
+# definitional prose must stay untouched). Dates can still look like
+# measurements, so date masks run first.
+_MEASURE_NUMBER_RE = re.compile(
+    r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)\s*[%％]?"  # decimal: 1.21, -8.1%
+    r"|[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)\s*[%％]"  # integer percent: 55%, 70%
+)
+# A forward-looking frame means the figure is a forecast, not a claim that a
+# backtest/analysis measured it — the measurement gate only polices "measured
+# facts" (#1336), forecasts stay under the "analysis, not advice" prompt rule.
+_FORECAST_FRAME_RE = re.compile(
+    r"(?:\b(?:forecast|expected|projected|predicted)\b|预计|预期|预测|估计|展望)",
     re.IGNORECASE,
 )
 _DERIVATION_RE = re.compile(
@@ -1052,6 +1084,7 @@ class GroundingLedger:
         self._identities: dict[str, IdentityRecord] = {}
         self._evidence: list[EvidenceRecord] = []
         self._tool_failures: list[dict[str, Any]] = []
+        self._analysis_completed: list[dict[str, Any]] = []
         self._validations: list[dict[str, Any]] = []
         self._recovery_rounds = 0
         self._symbol_resolution_attempts = 0
@@ -1342,6 +1375,10 @@ class GroundingLedger:
             return
 
         self._track_session_symbols(arguments, result)
+        if tool_name in _ANALYSIS_TOOLS:
+            self._analysis_completed.append(
+                {"call_id": call_id, "tool": tool_name, "recorded_at": _utc_now()}
+            )
         if tool_name == _RESOLVER_TOOL:
             self._ingest_resolution(arguments, payload, call_id)
         elif tool_name == "get_market_data":
@@ -1365,6 +1402,7 @@ class GroundingLedger:
         issues.extend(self._validate_identity(content))
         issues.extend(self._validate_unsourced_symbols(content))
         issues.extend(self._validate_price_claims(content))
+        issues.extend(self._validate_analysis_claims(content))
         result = ValidationResult(valid=not issues, issues=issues)
         self._validations.append(
             {
@@ -1393,7 +1431,7 @@ class GroundingLedger:
         for issue in validation.issues:
             code = issue.get("code")
             value = issue.get("value")
-            if code in {"numeric_claim_conflict", "numeric_claim_unavailable", "unsourced_symbol_figures"} and value is not None:
+            if code in {"numeric_claim_conflict", "numeric_claim_unavailable", "unsourced_symbol_figures", "analysis_claim_unavailable"} and value is not None:
                 symbol = issue.get("symbol") or ""
                 label = f"{value:g}" if isinstance(value, (int, float)) else str(value)
                 banned.append(f"{label} ({symbol})" if symbol else label)
@@ -2303,6 +2341,105 @@ class GroundingLedger:
                         }
                     )
         return issues
+
+    def _validate_analysis_claims(self, content: str) -> list[dict[str, Any]]:
+        """Reject backtest/analysis metrics with no supporting tool result.
+
+        #1336: after failed or deduplicated market-data calls the model may
+        still present return-volatility / drawdown / probability figures as
+        measured facts. Two support paths make a metric figure legitimate:
+
+        * a completed analysis tool (``_analysis_completed``) — the backtest
+          family, whose metric numbers live in run-dir files and therefore
+          never enter ``_evidence``; and
+        * value-level match against observed evidence — any successful tool's
+          numeric output (e.g. ``portfolio_risk_xray``) is flattened into
+          ``_evidence``, so a figure the run actually observed is accepted.
+
+        A figure with neither origin has no source but model memory. This is
+        the same shape as ``_compare_price_claim``: value in the observed
+        corpus → pass; value absent → reject. Note that a hand-maintained
+        analysis-tool list is deliberately avoided (see the test that replaced
+        the nine-tool price list with a uniqueness check).
+
+        Args:
+            content: Candidate assistant answer.
+
+        Returns:
+            One issue per metric-bearing clause or table row.
+        """
+        if self._analysis_completed:
+            return []
+        issues: list[dict[str, Any]] = []
+        lines = content.splitlines()
+        table_mode = any(
+            line.count("|") >= 2 and _ANALYSIS_METRIC_RE.search(line)
+            for line in lines
+        )
+        for line in lines:
+            is_table_line = table_mode and line.count("|") >= 2
+            # A pipe table whose header names metrics: every numeric cell row
+            # is a metric claim, even though the marker lives on the header
+            # line rather than the data row.
+            segments = [line] if is_table_line else _split_clauses(line)
+            for segment in segments:
+                masked = _LOCALIZED_DATE_RE.sub(" ", segment)
+                masked = _DATE_RE.sub(" ", masked)
+                masked = _SHORT_DATE_RE.sub(" ", masked)
+                masked = _DASH_DATE_RE.sub(" ", masked)
+                values = [
+                    match.group(0).replace(" ", "").replace(",", "")
+                    for match in _MEASURE_NUMBER_RE.finditer(masked)
+                ]
+                if not values:
+                    continue
+                if not is_table_line and not _ANALYSIS_METRIC_RE.search(segment):
+                    continue
+                if _FORECAST_FRAME_RE.search(segment):
+                    continue
+                unsupported = [
+                    value for value in values if not self._analysis_value_observed(value)
+                ]
+                if not unsupported:
+                    continue
+                issues.append(
+                    {
+                        "code": "analysis_claim_unavailable",
+                        "claim": segment.strip()[:200],
+                        "value": unsupported[0],
+                        "message": (
+                            "No backtest or analysis tool completed successfully "
+                            "in this session, yet the answer states analysis "
+                            "figures. Mark the analysis as incomplete and omit "
+                            "these figures."
+                        ),
+                    }
+                )
+        return issues
+
+    def _analysis_value_observed(self, raw: str) -> bool:
+        """Return True when a claim measurement matches observed evidence.
+
+        Tools disagree on scale: ``compute_risk_xray`` returns fractions
+        (annualized_vol 0.182, max_drawdown -0.094) while answers quote
+        percents (18.2%, -9.4%). Try both the value and its percent scaling
+        so an observed 0.182 grounds an 18.2% claim and vice versa.
+        """
+        try:
+            value = float(raw.replace("%", "").replace("％", "").replace(",", ""))
+        except ValueError:
+            return True
+        observed = [
+            float(record.value)
+            for record in self._evidence
+            if record.value is not None and record.status == "observed"
+        ]
+        candidates = {value, value / 100.0}
+        return any(
+            abs(candidate - item) <= max(abs(item) * 0.005, 1e-9)
+            for candidate in candidates
+            for item in observed
+        )
 
     def _validate_price_claims(self, content: str) -> list[dict[str, Any]]:
         """Check Markdown OHLC tables and price prose against observed records.
