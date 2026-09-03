@@ -2843,26 +2843,38 @@ def test_backtest_metrics_rejected_when_no_analysis_result(
 def test_backtest_metrics_accepted_after_successful_backtest(
     tmp_path: Path,
 ) -> None:
-    """#1336: a genuinely completed backtest grounds the same figures."""
+    """#1336: a genuinely completed backtest grounds metrics its artifact holds."""
+    run_dir = tmp_path / "runs" / "compare"
+    (run_dir / "artifacts").mkdir(parents=True)
+    (run_dir / "artifacts" / "metrics.csv").write_text(
+        "total_return,sharpe,max_drawdown\n0.124,1.21,-0.081\n",
+        encoding="utf-8",
+    )
     ledger = GroundingLedger(
         run_dir=tmp_path,
         user_message="比较几支标的并回测不同市场状态",
     )
     ledger.ingest_tool_result(
         tool_name="backtest",
-        arguments={"run_dir": "runs/compare"},
-        result=(
-            '{"exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": '
-            '["metrics.csv"], "run_dir": "runs/compare"}'
+        arguments={"run_dir": str(run_dir)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "exit_code": 0,
+                "run_dir": str(run_dir),
+                "artifacts": {
+                    "metrics.csv": str(run_dir / "artifacts" / "metrics.csv")
+                },
+            }
         ),
         call_id="bt-ok",
         success=True,
     )
 
     good = ledger.validate_final_answer(
-        "| 策略 | Return vol | MaxDD | Prob. of hitting target |\n"
+        "| 策略 | 年化收益 | 夏普比率 | MaxDD |\n"
         "|---|---:|---:|---:|\n"
-        "| M1 | 12.4% | -8.1% | 55% |"
+        "| M1 | 12.4% | 1.21 | -8.1% |"
     )
 
     assert good.valid is True, good.issues
@@ -2961,3 +2973,143 @@ def test_forecast_probability_is_not_a_measured_claim(tmp_path: Path) -> None:
     )
 
     assert good.valid is True, good.issues
+
+
+def test_valid_price_does_not_launder_unsupported_analysis_metric(
+    tmp_path: Path,
+) -> None:
+    """A valid quote must not make an invented backtest metric acceptable."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 现价多少",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {"AAPL.US": [{"trade_date": "2026-09-02", "close": 18.2}]}
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer(
+        "AAPL.US 收盘价 18.2 USD。历史回测年化波动率 18.2%。"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_successful_backtest_only_supports_metrics_in_its_artifact(
+    tmp_path: Path,
+) -> None:
+    """One successful result must not authorize unrelated invented metrics."""
+    metrics = tmp_path / "artifacts" / "metrics.csv"
+    metrics.parent.mkdir()
+    metrics.write_text("annual_return,sharpe\n0.182,1.21\n", encoding="utf-8")
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="回测策略",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "run_dir": str(tmp_path),
+                "artifacts": {"metrics": str(metrics)},
+            }
+        ),
+        call_id="backtest",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer(
+        "策略年化收益 18.2%，夏普比率 1.21，最大回撤 -9.4%。"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue.get("value") == "-9.4%" for issue in result.issues)
+
+
+def test_skipped_analysis_result_does_not_authorize_metrics(tmp_path: Path) -> None:
+    """A skipped/deduplicated call is not a completed analysis."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps({"skipped": True, "reason": "already completed"}),
+        call_id="backtest-skipped",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer("回测年化收益 18.2%，最大回撤 -9.4%。")
+
+    assert result.valid is False, result.issues
+
+
+def test_integer_historical_window_claim_is_rejected(tmp_path: Path) -> None:
+    """Categorical claims about all historical windows need evidence too."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="分析策略")
+
+    result = ledger.validate_final_answer("所有历史 12 个月窗口均实现正收益。")
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_analysis_definition_is_not_rejected(tmp_path: Path) -> None:
+    """A threshold definition is not a measured result from this session."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="什么是夏普比率？")
+
+    result = ledger.validate_final_answer("夏普比率大于 1.0 通常被认为较好。")
+
+    assert result.valid is True, result.issues
+
+
+def test_forecast_table_cell_does_not_exempt_measured_cell(
+    tmp_path: Path,
+) -> None:
+    """A forecast column must not hide an unsupported historical metric cell."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="比较两种策略")
+
+    result = ledger.validate_final_answer(
+        "| 策略 | 预计收益 | 历史最大回撤 |\n"
+        "|---|---:|---:|\n"
+        "| M1 | 预计 12.4% | -8.1% |"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_analysis_completion_is_persisted_with_metric_provenance(
+    tmp_path: Path,
+) -> None:
+    """The grounding artifact records why an analysis figure was accepted."""
+    metrics = tmp_path / "artifacts" / "metrics.csv"
+    metrics.parent.mkdir()
+    metrics.write_text("annual_return\n0.182\n", encoding="utf-8")
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "run_dir": str(tmp_path),
+                "artifacts": {"metrics": str(metrics)},
+            }
+        ),
+        call_id="backtest",
+        success=True,
+    )
+
+    artifact = json.loads(
+        (tmp_path / "artifacts" / "grounding_evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert artifact["analysis_evidence"]
+    assert artifact["analysis_evidence"][0]["metric"] == "return"
