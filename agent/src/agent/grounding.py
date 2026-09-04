@@ -342,6 +342,15 @@ _DERIVATION_RE = re.compile(
     r"(?:\bderived\b|\bcalculated\b|\bformula\b|\bbased on\b|计算|推导|公式|基于)",
     re.IGNORECASE,
 )
+# "从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4" / "rose from 100.0 to
+# 112.4": a return figure framed as growth between two endpoints is
+# arithmetic on sourced inputs, not an invented backtest metric (#1338
+# review). The frame alone never grounds anything — the values must also
+# match an observed endpoint pair exactly (see _return_derived_from_observed).
+_GROWTH_FRAME_RE = re.compile(
+    r"从[^，。;；\n]{0,60}?(?:到|至)|\bfrom\b[^,;。\n]{0,80}?\bto\b",
+    re.IGNORECASE,
+)
 _NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     r"(?![A-Za-z0-9_])"
@@ -966,6 +975,17 @@ def _metric_kind_for_path(path: str) -> str | None:
     kind = _ANALYSIS_KIND_ALIASES.get(leaf)
     if kind is not None:
         return kind
+    # Compound leaves name the kind as a token ("reported_annualized_return",
+    # "strategy_max_drawdown"). #1338 review: matching only the verbatim alias
+    # table makes every other spelling silently ungroundable. Scan from the
+    # right — English compounds put the head noun last, so "return_vol"
+    # resolves to vol, never to return.
+    tokens = [token for token in re.split(r"[_.]", leaf) if token]
+    for size in (2, 1):
+        for start in range(len(tokens) - size, -1, -1):
+            kind = _ANALYSIS_KIND_ALIASES.get("_".join(tokens[start : start + size]))
+            if kind is not None:
+                return kind
     return _metric_kind_for_text(path)
 
 
@@ -2645,6 +2665,7 @@ class GroundingLedger:
         issues: list[dict[str, Any]] = []
         lines = content.splitlines()
         consumed: set[int] = set()
+        price_records = self._comparable_price_records()
         for header, rows, row_indices in self._pipe_tables(lines):
             consumed.update(row_indices)
             columns = [
@@ -2691,6 +2712,7 @@ class GroundingLedger:
         for index, line in enumerate(lines):
             if index in consumed:
                 continue
+            line_symbol = self._symbol_for_claim(line, price_records)
             for segment in _split_clauses(line):
                 if _CATEGORICAL_WINDOW_RE.search(segment) and _NUMBER_RE.search(segment):
                     if not any(
@@ -2729,6 +2751,19 @@ class GroundingLedger:
                 ]
                 if not unsupported:
                     continue
+                # A return figure may be arithmetic on sourced inputs rather
+                # than an invented backtest metric (#1338 review): an explicit
+                # formula anchored to observed values, or growth between two
+                # observed endpoints stated in the same line.
+                if kind == "return":
+                    if _DERIVATION_RE.search(line) and self._is_explicit_derivation(
+                        line, price_records, line_symbol
+                    ):
+                        continue
+                    if _GROWTH_FRAME_RE.search(line) and self._return_derived_from_observed(
+                        unsupported, price_records, line_symbol
+                    ):
+                        continue
                 issues.append(
                     {
                         "code": "analysis_claim_unavailable",
@@ -2819,6 +2854,46 @@ class GroundingLedger:
             return abs(candidate - item) <= max(abs(item) * 0.005, 1e-9)
 
         return any(close(candidate, item) for candidate in candidates for item in observed)
+
+    def _return_derived_from_observed(
+        self,
+        claimed: Sequence[str],
+        records: Sequence[EvidenceRecord],
+        symbol: str | None,
+    ) -> bool:
+        """True when a return figure equals growth between observed endpoints.
+
+        #1338 review: "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的
+        112.4，区间收益率为 12.4%" states arithmetic on sourced inputs. Only
+        an exact (±0.5%) match against a pair of observed values grounds the
+        figure; the caller must already have verified the from/to frame, so a
+        bare unanchored return claim never reaches here.
+        """
+        candidates = [record for record in records if record.value is not None]
+        if symbol:
+            candidates = [record for record in candidates if record.symbol == symbol]
+        observed = sorted({float(record.value) for record in candidates})
+        if len(observed) < 2:
+            return False
+        values: list[float] = []
+        for raw in claimed:
+            try:
+                values.append(float(str(raw).rstrip("%％")))
+            except ValueError:
+                continue
+        for base in observed:
+            for target in observed:
+                if target == base:
+                    continue
+                derived = (target - base) / base
+                for value in values:
+                    if abs(value - derived) <= max(abs(derived) * 0.005, 1e-9):
+                        return True
+                    if abs(value - derived * 100.0) <= max(
+                        abs(derived * 100.0) * 0.005, 1e-9
+                    ):
+                        return True
+        return False
 
     def _validate_price_claims(self, content: str) -> list[dict[str, Any]]:
         """Check Markdown OHLC tables and price prose against observed records.

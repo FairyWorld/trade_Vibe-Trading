@@ -3113,3 +3113,180 @@ def test_analysis_completion_is_persisted_with_metric_provenance(
 
     assert artifact["analysis_evidence"]
     assert artifact["analysis_evidence"][0]["metric"] == "return"
+
+
+def test_derived_interval_return_from_observed_endpoints_is_allowed(
+    tmp_path: Path,
+) -> None:
+    """#1338 review: a return figure derived from observed endpoints stays legal.
+
+    Both endpoints are observed evidence and the answer states the growth
+    inline — arithmetic on sourced inputs, not an invented backtest metric.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 最近一个月走势如何",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4，"
+        "区间收益率为 12.4%。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_derived_cumulative_return_english_is_allowed(tmp_path: Path) -> None:
+    """#1338 review: same derivation exemption for the English shape."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US price history",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "AAPL.US rose from 100.0 to 112.4, a cumulative return of 12.4% "
+        "over the window."
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_unanchored_return_claim_is_still_rejected(tmp_path: Path) -> None:
+    """Without the from/to frame, a return figure stays gated."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 价格",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "AAPL.US 区间收益率为 12.4%，历史回测年化收益 18.2%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_wrong_derived_return_arithmetic_is_rejected(tmp_path: Path) -> None:
+    """A from/to frame with arithmetic that no observed pair supports fails."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 价格",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4，"
+        "区间收益率为 30.5%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue.get("value") == "30.5%" for issue in bad.issues
+    )
+
+
+def test_research_paper_reported_metrics_are_grounded(tmp_path: Path) -> None:
+    """#1338 review: attributed paper figures must not be suppressed.
+
+    research_papers reports `reported_annualized_return` / `reported_max_drawdown`
+    — compound leaves whose kind must resolve by token, not verbatim alias.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="查一下动量策略论文的回测表现",
+    )
+    ledger.ingest_tool_result(
+        tool_name="research_papers",
+        arguments={"query": "momentum"},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {
+                    "results": [
+                        {
+                            "title": "Momentum crashes",
+                            "reported_annualized_return": 0.182,
+                            "reported_max_drawdown": -0.094,
+                        }
+                    ]
+                },
+            }
+        ),
+        call_id="rp-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "该论文报告其策略年化收益 18.2%，最大回撤 -9.4%（论文自述，非本次回测）。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_compound_metric_leaf_kind_resolution() -> None:
+    """Token-split kind resolution covers the compound-leaf family."""
+    from src.agent.grounding import _metric_kind_for_path
+
+    assert _metric_kind_for_path("results[0].reported_annualized_return") == "return"
+    assert _metric_kind_for_path("strategy_max_drawdown") == "drawdown"
+    assert _metric_kind_for_path("data.benchmark_return_vol") == "vol"
+    assert _metric_kind_for_path("data.hit_rate_daily") == "win_rate"
+    assert _metric_kind_for_path("data.risk_free_rate") is None
+    assert _metric_kind_for_path("data.trade_count") is None
