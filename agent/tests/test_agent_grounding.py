@@ -3290,3 +3290,79 @@ def test_compound_metric_leaf_kind_resolution() -> None:
     assert _metric_kind_for_path("data.hit_rate_daily") == "win_rate"
     assert _metric_kind_for_path("data.risk_free_rate") is None
     assert _metric_kind_for_path("data.trade_count") is None
+
+
+def test_analysis_gates_accept_attributed_paper_restatement(tmp_path: Path) -> None:
+    """An attributed figure is a citation, not an invented measurement (#1338
+    review): 'The paper reports a Sharpe ratio of 1.8' must pass with zero tool
+    results, in both languages, while unattributed phrasing stays blocked."""
+    for answer in (
+        "The paper reports a Sharpe ratio of 1.8 for the momentum factor.",
+        "该论文报告其策略夏普比率为 1.8。",
+        "研究显示该策略年化收益 18.2%。",
+        "Analysts estimate an annualized volatility of 22%.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Research the factor.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert not [i for i in issues if i.get("code") == "analysis_claim_unavailable"], (
+            answer,
+            issues,
+        )
+
+
+def test_analysis_gate_still_rejects_unattributed_and_unsourced(
+    tmp_path: Path,
+) -> None:
+    """The attribution exemption must not launder model-memory figures: the
+    review's pinned reject pair and an invented metric with an ordinary prose
+    subject keep failing."""
+    for answer in (
+        "TSLA.US last traded at 412.35 USD.",
+        "特斯拉现价 412.35 美元。",
+        "The strategy reports a Sharpe ratio of 1.8.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Analyze something.")
+        ledger.ingest_tool_result(
+            tool_name="get_market_data",
+            arguments={"codes": ["AAPL.US"]},
+            result=json.dumps(
+                {
+                    "AAPL.US": [
+                        {
+                            "trade_date": "2026-09-02T00:00:00",
+                            "close": 112.4,
+                        }
+                    ]
+                }
+            ),
+            call_id="md-1",
+            success=True,
+        )
+        issues = ledger.validate_final_answer(answer).issues
+        assert issues, answer
+        assert not any(
+            issue.get("code") == "analysis_claim_unavailable" and "1.8" not in str(issue)
+            for issue in issues
+        ), answer
+
+
+def test_attribution_exemption_cannot_launders_self_claims(tmp_path: Path) -> None:
+    """The #1336 attack shape must not escape via attribution vocabulary:
+    "the backtest/data shows" is a self-claim, and a citation in one clause
+    must not exempt an invented sibling metric in the next."""
+    for answer in (
+        "The backtest data shows an annualized return of 25%.",
+        "回测数据显示策略年化收益 25%。",
+        "数据显示策略夏普比率为 3.5。",
+        "根据本次回测，年化波动率 18.2%。",
+        "The strategy reports a Sharpe ratio of 1.8.",
+        # citation in clause 1, invented sibling in clause 2
+        "The paper reports a Sharpe ratio of 1.8, and our strategy achieved "
+        "an annualized return of 47.3%.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Research the factor.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert [i for i in issues if i.get("code") == "analysis_claim_unavailable"], (
+            answer,
+            issues,
+        )

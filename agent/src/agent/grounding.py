@@ -252,6 +252,28 @@ _ANALYSIS_METRIC_RE = re.compile(
     r"夏普|回撤|波动率|胜率|命中率|概率|年化|回测|窗口|收益(?:率)?|回报(?:率)?)",
     re.IGNORECASE,
 )
+# Phrases that indicate a figure is attributed to an external source rather
+# than model memory (paper restatement, #1338 review). Attributing a number
+# to a named source is the opposite of an unsourced claim. The subject list
+# is deliberately restricted to sources that cannot be this run's own output
+# (papers, studies, analysts, filings): "the backtest reports" / "the data
+# shows" is exactly how a model dresses up its own numbers (#1336), so
+# data/backtest/strategy/report subjects do NOT count.
+_ATTRIBUTION_RE = re.compile(
+    r"(?:"
+    r"\b(?:the\s+(?:papers?|studies?|researchers?|analysts?|surveys?"
+    r"|regulators?|authorities|literature|authors?)"
+    r"|analysts?|researchers?|literature|sec\s+filings?\b|filings?"
+    r"|annual\s+filings?|quarterly\s+filings?|rating\s+agencies?)"
+    r"\s+(?:reports?|estimates?|shows?|indicates?|suggests?|states?|claims?"
+    r"|notes?|cites?|mentions?|reveals?|discloses?|publishes?|found"
+    r"|calculated|computed|derived)\b"
+    r"|"
+    r"(?:论文|文献|研究|分析师|研究机构|学者)"
+    r"[^。，\n]{0,6}?(?:报告|显示|表明|指出|称|估计|发现)"
+    r")",
+    re.IGNORECASE,
+)
 # Measurement-shaped numbers for analysis claims: keeps the % sign and sign
 # (unlike _numbers_without_dates_or_percent, which drops percentages on
 # purpose). A bare integer is NOT a measurement — "252 个交易日年化" is the
@@ -2624,6 +2646,13 @@ class GroundingLedger:
                 )
                 if not unknown or not self._numbers_without_dates_or_percent(segment):
                     continue
+                # Accept figures that are attributed to an external source
+                # (e.g., "The paper reports a Sharpe ratio of 1.8.") rather
+                # than model memory. Scoped to the clause: a line-level check
+                # would let a citation in one clause launder an invented
+                # sibling metric in the next.
+                if _ATTRIBUTION_RE.search(segment):
+                    continue
                 for symbol in unknown:
                     reported.add(symbol)
                     issues.append(
@@ -2735,6 +2764,12 @@ class GroundingLedger:
                         )
                     continue
                 if _DEFINITION_FRAME_RE.search(segment):
+                    continue
+                # Attributed figures ("The paper reports a Sharpe of 1.8",
+                # or the marker in a neighbouring clause: "据研究显示，策略
+                # 年化收益 18.2%") are citations, not invented measurements
+                # — skip the gate.
+                if _ATTRIBUTION_RE.search(segment):
                     continue
                 values = self._measure_numbers(segment)
                 if not values:
