@@ -3299,7 +3299,8 @@ def test_analysis_gates_accept_attributed_paper_restatement(tmp_path: Path) -> N
     for answer in (
         "The paper reports a Sharpe ratio of 1.8 for the momentum factor.",
         "该论文报告其策略夏普比率为 1.8。",
-        "研究显示该策略年化收益 18.2%。",
+        "研究机构指出该策略年化收益 18.2%。",
+        "文献指出因子年化收益 18.2%。",
         "Analysts estimate an annualized volatility of 22%.",
     ):
         ledger = GroundingLedger(run_dir=tmp_path, user_message="Research the factor.")
@@ -3356,6 +3357,10 @@ def test_attribution_exemption_cannot_launders_self_claims(tmp_path: Path) -> No
         "数据显示策略夏普比率为 3.5。",
         "根据本次回测，年化波动率 18.2%。",
         "The strategy reports a Sharpe ratio of 1.8.",
+        "研究显示策略年化收益 25%。",
+        "研究报告显示策略年化收益 25%。",
+        "回测研究显示策略年化收益 25%。",
+        "投资者普遍认为其年化收益 25%。",
         # citation in clause 1, invented sibling in clause 2
         "The paper reports a Sharpe ratio of 1.8, and our strategy achieved "
         "an annualized return of 47.3%.",

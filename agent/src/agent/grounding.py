@@ -269,7 +269,7 @@ _ATTRIBUTION_RE = re.compile(
     r"|notes?|cites?|mentions?|reveals?|discloses?|publishes?|found"
     r"|calculated|computed|derived)\b"
     r"|"
-    r"(?:论文|文献|研究|分析师|研究机构|学者)"
+    r"(?:论文|文献|分析师|研究机构|学者)"
     r"[^。，\n]{0,6}?(?:报告|显示|表明|指出|称|估计|发现)"
     r")",
     re.IGNORECASE,
