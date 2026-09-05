@@ -2968,6 +2968,16 @@ class GroundingLedger:
                 )
                 if self._is_explicit_derivation(segment, records, symbol):
                     continue
+                # An attributed figure ("The paper reports TSLA.US traded at
+                # 412.35") is a citation, not an invented price — skip the
+                # price gate too, for the same reason as the analysis and
+                # unsourced-symbol gates. Without this, an attributed price
+                # is rejected or accepted purely on whether its verb happens
+                # to match _PRICE_CONTEXT_RE ("reports" does, "estimate"
+                # doesn't), which is the exact vocabulary asymmetry under
+                # review.
+                if _ATTRIBUTION_RE.search(segment):
+                    continue
                 for value in values:
                     issue = self._compare_price_claim(
                         value=value,
