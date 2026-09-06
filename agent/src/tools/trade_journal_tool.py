@@ -233,7 +233,8 @@ def _compute_profile(df: pd.DataFrame) -> dict[str, Any]:
 
     Returns:
         Dict with avg_holding_days, trade_frequency_per_week, win_rate,
-        profit_loss_ratio, total_pnl, total_dividends, max_drawdown,
+        profit_loss_ratio, total_pnl, total_dividends,
+        dividend_rows_missing_cash, max_drawdown,
         top_symbols, market_distribution, hourly_distribution,
         roundtrips_sample.
     """
@@ -246,6 +247,13 @@ def _compute_profile(df: pd.DataFrame) -> dict[str, Any]:
     trades_df = df[df["side"].isin(("buy", "sell"))]
     dividend_amounts = df.loc[df["side"] == "dividend", "amount"]
     total_dividends = round(float(dividend_amounts.sum()), 2)
+    # A dividend row that parsed with no cash is almost never a real zero
+    # payout — it means the export named its cash column something the parser
+    # did not recognise, and the payout would otherwise be booked as 0 with
+    # nothing to show for it. Surface the count so the caller can see that the
+    # journal was read but the money was not, instead of trusting a total that
+    # silently omits it.
+    dividend_rows_missing_cash = int((dividend_amounts == 0).sum())
 
     total_trades = len(trades_df)
     span_days = max(1, (df["datetime"].max() - df["datetime"].min()).days)
@@ -300,6 +308,7 @@ def _compute_profile(df: pd.DataFrame) -> dict[str, Any]:
         "profit_loss_ratio": pnl_ratio,
         "total_pnl": total_pnl,
         "total_dividends": total_dividends,
+        "dividend_rows_missing_cash": dividend_rows_missing_cash,
         "max_drawdown": max_drawdown,
         "top_symbols": top_symbols,
         "market_distribution": market_dist,

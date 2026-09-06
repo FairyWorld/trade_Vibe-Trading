@@ -824,3 +824,71 @@ def test_parse_generic_currency_price_not_zero() -> None:
     assert rec[0].price == 150.25
     assert rec[0].fee == 1.0
     assert rec[0].amount == 1502.5
+
+
+# ── M3d: a dividend's cash may not live in the fill column ────────────────
+
+
+def test_dividend_cash_read_from_a_cash_movement_column(tmp_path: Path) -> None:
+    """A 红利入账 row books its payout even when 成交金额 is not where it sits.
+
+    A dividend row has no quantity and no price, so the usual
+    ``成交金额 or qty * price`` fallback collapses to 0.0. Brokers book the
+    payout under a cash-movement heading instead, and reading only the fill
+    column would record the dividend as 0 silently — the exact
+    "run succeeded, number is zero" shape #1207 item 15 is about.
+    """
+    for cash_column in ("发生金额", "资金发生额", "红利金额", "实发金额"):
+        csv = tmp_path / f"ths_{cash_column}.csv"
+        csv.write_text(
+            "成交时间,证券代码,证券名称,操作,成交数量,成交价格,成交金额,"
+            f"{cash_column},手续费,印花税,过户费\n"
+            "2026-01-02 09:35:00,600519,贵州茅台,买入,100,1700,170000,0,5,0,0.1\n"
+            "2026-01-08 10:00:00,600519,贵州茅台,卖出,100,1800,180000,0,5,180,0.1\n"
+            # the fill column is empty for a payout; the money is in the other one
+            "2026-01-10 09:00:00,600519,贵州茅台,红利入账,0,0,0,500,0,0,0\n",
+            encoding="utf-8",
+        )
+
+        _fmt, records = parse_file(csv)
+        payouts = [r for r in records if r.side == "dividend"]
+        assert len(payouts) == 1, cash_column
+        assert payouts[0].amount == pytest.approx(500.0), (
+            f"{cash_column}: dividend cash silently booked as {payouts[0].amount}"
+        )
+
+
+def test_unreadable_dividend_cash_is_surfaced_not_silently_zero() -> None:
+    """A zero-cash dividend row must be counted, not averaged in as a real 0.
+
+    If a broker names the cash column something none of the parsers know, the
+    payout still cannot be read — but the caller has to be able to SEE that,
+    rather than trust a total that quietly omits the money.
+    """
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+                _dividend_rec("2026-01-10 09:00:00", "A.SH", 0.0),
+                _dividend_rec("2026-01-11 09:00:00", "A.SH", 500.0),
+            ]
+        )
+    )
+    assert profile["dividend_rows_missing_cash"] == 1
+    assert profile["total_dividends"] == 500.0
+    assert profile["total_pnl"] == 700.0
+
+
+def test_clean_journal_reports_no_missing_dividend_cash() -> None:
+    """The counter must not fire on a journal that parsed correctly."""
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+                _dividend_rec("2026-01-10 09:00:00", "A.SH", 500.0),
+            ]
+        )
+    )
+    assert profile["dividend_rows_missing_cash"] == 0
