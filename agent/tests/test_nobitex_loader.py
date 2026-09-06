@@ -196,3 +196,26 @@ class TestRoutingPattern:
         assert detect_source("usdtirt") == "nobitex"
         assert detect_source("BTC-USDT") == "okx"
         assert detect_source("AAPL.US") == "yahoo"
+
+
+def test_toman_sources_never_degrade_into_the_crypto_chain(monkeypatch) -> None:
+    """An unavailable IRT/TMN source must fail loudly, not fall back.
+
+    Nobitex and Wallex are the only sources quoting in Iranian Toman, and they
+    declare ``markets = {"crypto"}`` only so the resolver can reach them. If an
+    unreachable Iranian endpoint degraded into the crypto chain, a ``BTCIRT``
+    request would come back as a USDT-quoted series presented as Toman — a
+    caliber error of roughly six orders of magnitude. Same rule as ``fmp``
+    (#1270), for a worse failure.
+    """
+    import pytest
+
+    from backtest.loaders import registry as loader_registry
+
+    loader_registry._ensure_registered()
+    for source in ("nobitex", "wallex"):
+        loader_cls = loader_registry.LOADER_REGISTRY[source]
+        monkeypatch.setattr(loader_cls, "is_available", lambda self: False)
+        with pytest.raises(loader_registry.NoAvailableSourceError) as excinfo:
+            loader_registry.get_loader_cls_with_fallback(source)
+        assert "does not fall back" in str(excinfo.value), source

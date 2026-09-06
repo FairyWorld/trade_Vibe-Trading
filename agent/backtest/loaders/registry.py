@@ -135,7 +135,15 @@ def _ensure_registered() -> None:
 # ``fmp`` joins because an explicit ``source="fmp"`` request must not silently
 # return data from a different source when the Stable endpoint 403s — the
 # caller asked for FMP provenance, not a Yahoo fallback (issue #1270).
-_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local", "qveris", "tickerall", "fmp"})  # QVERIS-INTEGRATION
+# ``nobitex``/``wallex`` join for a stronger version of the same reason: they
+# are the only sources quoting in Iranian Toman, and they declare
+# ``markets = {"crypto"}`` purely to be reachable. Degrading an unavailable
+# ``BTCIRT`` request into the crypto chain would hand a USDT-quoted series back
+# as if it were Toman — a caliber error of about six orders of magnitude, not a
+# missing-data error. An unreachable Iranian endpoint must be visible.
+_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset(
+    {"local", "qveris", "tickerall", "fmp", "nobitex", "wallex"}
+)  # QVERIS-INTEGRATION
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +466,12 @@ def get_loader_cls_with_fallback(source: str) -> Type[Any]:
                      "list at least one source.",
             "tickerall": "Set TICKERALL_API_KEY and TICKERALL_ACCOUNT_ID.",
             "fmp": "Set FMP_API_KEY.",
+            "nobitex": "Nobitex's public endpoint was unreachable. It quotes in "
+                       "Toman (IRT) and has no substitute — check network access "
+                       "to apiv2.nobitex.ir.",
+            "wallex": "Wallex's public endpoint was unreachable. It quotes in "
+                      "Toman (TMN) and has no substitute — check network access "
+                      "to api.wallex.ir.",
         }.get(source, "")
         raise NoAvailableSourceError(
             f"Data source '{source}' is unavailable and does not fall back to a "
