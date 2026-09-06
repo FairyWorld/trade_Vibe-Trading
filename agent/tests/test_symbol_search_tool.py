@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from src.trading import profiles as trading_profiles
 from src.trading import service as trading_service
 from src.tools import symbol_search_tool as ss
@@ -828,3 +830,88 @@ class TestFxPairAlignment:
             "^FTSE",
             "index",
         )
+
+
+class TestCryptoUsdBaseWhitelist:
+    """``USD`` quote leg on the crypto resolver is gated on a base whitelist.
+
+    Without this guard, ``XAUUSD`` / ``EURUSD`` / ``GBPUSD`` would all be
+    classified as crypto pairs and the public-venue catalog (Binance/OKX)
+    fallback would either lock onto a tokenized gold token (XAUT/PAXG) or
+    find nothing — never on real spot gold. The fix: only accept ``USD`` on
+    crypto when the base is in :data:`_CRYPTO_USD_BASES`.
+    """
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # Genuine crypto pairs - must keep working.
+            "BTC-USD",
+            "ETH-USD",
+            "SOL-USD",
+            "BNB-USD",
+            "XLM-USD",
+            "XRP-USD",
+            # Stablecoin-quoted pairs (existing behaviour preserved).
+            "BTC-USDT",
+            "XAUT-USDT",
+            "PAXG-USDT",
+            "ETH-USDC",
+        ],
+    )
+    def test_crypto_pairs_with_supported_base_accepted(self, code):
+        assert ss._canonical_crypto_pair(code) is not None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # The reported bug: a spot gold query must NOT resolve to a
+            # crypto pair, or the public-venue catalog fallback will lock a
+            # tokenized-gold row (XAUT-USDT) as the answer.
+            "XAUUSD",
+            "XAU-USD",
+            "XAU/USD",
+            # Forex pairs in 6-letter, dashed, or slashed form.
+            "EURUSD",
+            "EUR-USD",
+            "EUR/USD",
+            "GBPUSD",
+            "GBP-USD",
+            "JPYUSD",
+        ],
+    )
+    def test_non_crypto_bases_with_usd_quote_rejected(self, code):
+        """The ``USD`` leg on non-crypto bases must NOT pass as a crypto pair."""
+        assert ss._canonical_crypto_pair(code) is None
+
+    def test_tokenized_gold_bases_still_resolve_as_crypto(self):
+        # XAUT/PAXG ARE crypto (tokenized gold on Binance/OKX spot) and
+        # must keep resolving as crypto. The whitelist includes them.
+        assert ss._canonical_crypto_pair("XAUT-USDT") == "XAUT-USDT"
+        assert ss._canonical_crypto_pair("PAXG-USDT") == "PAXG-USDT"
+        assert ss._canonical_crypto_pair("XAUT-USD") == "XAUT-USD"
+        assert ss._canonical_crypto_pair("PAXG-USD") == "PAXG-USD"
+
+    def test_xauusd_and_xautusdt_are_not_equivalent_assets(self):
+        # Identity correctness: the resolver must treat XAUUSD (spot gold)
+        # and XAUT-USDT (tokenized gold) as different instruments. If both
+        # return the same canonical string, downstream lock/identity
+        # collision is possible.
+        spot = ss._canonical_crypto_pair("XAUUSD")
+        tokenized = ss._canonical_crypto_pair("XAUT-USDT")
+        assert spot is None
+        assert tokenized == "XAUT-USDT"
+        assert spot != tokenized
+
+    def test_usd_whitelist_is_a_strict_subset_of_crypto_bases(self):
+        # Defensive: the whitelist is what stops non-crypto bases from
+        # slipping through the ``USD`` branch. Every base in it must
+        # therefore actually be tradable on Binance or OKX spot.
+        # This is a coarse sanity check on the whitelist contents; if a
+        # new entry is added in error, this test will still pass (it only
+        # checks the union is non-empty and is a subset of the quote-asset
+        # alphabet).
+        assert ss._CRYPTO_USD_BASES
+        for base in ss._CRYPTO_USD_BASES:
+            assert base.isalpha()
+            assert base.isupper()

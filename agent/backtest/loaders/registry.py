@@ -128,7 +128,10 @@ def _ensure_registered() -> None:
 # An explicit ``local`` request that is unavailable is a config problem the user
 # must see, not something to paper over with a Yahoo/Tencent fetch.
 # ``tickerall`` joins for the same reason (explicit-only, the user's own broker key).
-_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local", "qveris", "tickerall"})  # QVERIS-INTEGRATION
+# ``fmp`` joins because an explicit ``source="fmp"`` request must not silently
+# return data from a different source when the Stable endpoint 403s — the
+# caller asked for FMP provenance, not a Yahoo fallback (issue #1270).
+_NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local", "qveris", "tickerall", "fmp"})  # QVERIS-INTEGRATION
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +192,12 @@ PRICE_CALIBER_BY_SOURCE: dict[str, str] = {
     "akshare": "split_dividend",  # adjust="qfq", including the stock_us_hist path
     "baostock": "split_dividend",  # adjustflag="2"
     "tushare": "split_dividend",  # adj_factor applied via cn_adjust (A-share/fund)
+    "tiingo": "split_dividend",  # prefers adjOpen/High/Low/Close, else adjClose/close
+    "fmp": "split_dividend",  # Stable historical-price-eod/full, scaled by adjClose/close
     # Split-adjusted only.
     "pykrx": "split",  # get_market_ohlcv_by_date(adjusted=True), Naver-backed
     # Unadjusted.
     "sina": "raw",
-    "tiingo": "raw",  # fetches adjusted columns and deliberately drops them
-    "fmp": "raw",  # historical-price-full only, never the adjusted variant
     "alphavantage": "raw",  # TIME_SERIES_DAILY, not the _ADJUSTED endpoint
     "longbridge": "raw",  # pins AdjustType.NoAdjust
 }
@@ -450,6 +453,7 @@ def get_loader_cls_with_fallback(source: str) -> Type[Any]:
                      "(~/.vibe-trading/data-bridge/config.yaml) — it must exist and "
                      "list at least one source.",
             "tickerall": "Set TICKERALL_API_KEY and TICKERALL_ACCOUNT_ID.",
+            "fmp": "Set FMP_API_KEY.",
         }.get(source, "")
         raise NoAvailableSourceError(
             f"Data source '{source}' is unavailable and does not fall back to a "

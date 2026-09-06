@@ -43,9 +43,9 @@ def _df() -> pd.DataFrame:
         ("baostock", "split_dividend"),
         ("tushare", "split_dividend"),
         ("pykrx", "split"),
+        ("tiingo", "split_dividend"),
+        ("fmp", "split_dividend"),
         ("sina", "raw"),
-        ("tiingo", "raw"),
-        ("fmp", "raw"),
         ("alphavantage", "raw"),
         ("longbridge", "raw"),
         # Neither measured nor pinned by an endpoint choice: must not guess.
@@ -231,3 +231,49 @@ def test_fetch_data_map_silent_on_single_caliber(
 
     assert result.caliber_warning is None
     assert "mixed price calibers" not in caplog.text
+
+
+# --------------------------------------------------------------------------
+# The table is a claim about the loader. #1320 changed the FMP and Tiingo
+# loaders to serve adjusted OHLC and left this table saying "raw", which is
+# worse than the bug it fixed: a mislabelled frame is what the mixed-caliber
+# comparison is built to catch, and it cannot catch its own label. These pin
+# the two together, so flipping one without the other goes red.
+# --------------------------------------------------------------------------
+
+
+def _bar(**over):
+    bar = {
+        "date": "2024-01-03",
+        "open": 100.0,
+        "high": 100.0,
+        "low": 100.0,
+        "close": 100.0,
+        "adjClose": 50.0,
+        "volume": 1000.0,
+    }
+    bar.update(over)
+    return bar
+
+
+def test_fmp_loader_serves_the_caliber_the_table_claims() -> None:
+    from backtest.loaders.fmp_loader import _parse_historical
+
+    assert price_caliber("fmp", "us_equity") == "split_dividend"
+    df = _parse_historical([_bar()])
+    assert df is not None
+    # adjClose/close = 0.5, so OHLC halves and volume does not.
+    assert df["close"].iloc[0] == pytest.approx(50.0)
+    assert df["open"].iloc[0] == pytest.approx(50.0)
+    assert df["volume"].iloc[0] == pytest.approx(1000.0)
+
+
+def test_tiingo_loader_serves_the_caliber_the_table_claims() -> None:
+    from backtest.loaders.tiingo_loader import _rows_to_frame
+
+    assert price_caliber("tiingo", "us_equity") == "split_dividend"
+    df = _rows_to_frame([_bar(date="2024-01-03T00:00:00.000Z")])
+    assert df is not None
+    assert df["close"].iloc[0] == pytest.approx(50.0)
+    assert df["open"].iloc[0] == pytest.approx(50.0)
+    assert df["volume"].iloc[0] == pytest.approx(1000.0)

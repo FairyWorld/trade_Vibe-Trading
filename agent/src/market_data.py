@@ -265,19 +265,24 @@ def fetch_market_data(
         # sources: the override list IS the attempt order, so a user who put
         # tushare first actually starts there. Guards: explicit source
         # requests stay src-first; the fallback_chain_provider test hook wins;
-        # local:/qveris/tickerall keep their no-network entry point.
-        override = (
-            get_source_order_override(market)
-            if source == "auto"
-            and fallback_chain_provider is None
-            and src not in _NO_NETWORK_FALLBACK_SOURCES
-            else None
-        )
-        candidates = (
-            list(override)
-            if override is not None and src in override
-            else [src, *chain]
-        )
+        # local:/qveris/tickerall/fmp keep their no-network entry point
+        # (explicit fmp must not silently return yahoo on Stable 403 — issue #1270).
+        # Sources in _NO_NETWORK_FALLBACK_SOURCES never walk the chain.
+        if src in _NO_NETWORK_FALLBACK_SOURCES:
+            candidates = [src]
+            override = None
+        else:
+            override = (
+                get_source_order_override(market)
+                if source == "auto"
+                and fallback_chain_provider is None
+                else None
+            )
+            candidates = (
+                list(override)
+                if override is not None and src in override
+                else [src, *chain]
+            )
         # Deduplicate (preserving order), then cap the attempt budget.
         attempts: list[str] = []
         for candidate in candidates:

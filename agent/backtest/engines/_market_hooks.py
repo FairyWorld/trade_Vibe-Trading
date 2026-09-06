@@ -25,7 +25,9 @@ from backtest.models import Position
 _MARKET_PATTERNS = [
     (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "a_share"),
     (re.compile(r"^(51|15|56)\d{4}\.(SZ|SH)$", re.I), "a_share"),
-    (re.compile(r"^[A-Z]+\.US$", re.I), "us_equity"),
+    # US equities: tickers may carry a class-share dot (BRK.B.US, BF.B.US)
+    # and a hyphen (e.g. BF-B.US) — same characters as ca/india/uk below.
+    (re.compile(r"^[A-Z0-9&.\-]+\.US$", re.I), "us_equity"),
     (re.compile(r"^\d{3,5}\.HK$", re.I), "hk_equity"),
     # India equities: NSE (RELIANCE.NS) / BSE (500325.BO); tickers may carry
     # '&' and '-' (e.g. M&M.NS, BAJAJ-AUTO.NS).
@@ -57,19 +59,38 @@ _MARKET_PATTERNS = [
     # Forex pairs: XXX/YYY or XXXXXX.FX
     (re.compile(r"^[A-Z]{3}/[A-Z]{3}$"), "forex"),
     (re.compile(r"^[A-Z]{6}\.FX$"), "forex"),
-    # Yahoo forex suffix convention (EURUSD=X, GBPCNY=X) — served verbatim by
-    # the chart endpoint. Without this rule such symbols fell through to the
-    # a_share default (misrouting composite/market classification).
-    (re.compile(r"^[A-Z]{3,6}=X$"), "forex"),
+    # Yahoo notations for FX and futures. ``=X`` is Yahoo's forex form
+    # (``XAUUSD=X``, ``EURUSD=X``, ``GBPCNY=X``); ``=F`` is Yahoo's
+    # continuous-front-month futures form (``GC=F``, ``CL=F``, ``SI=F``,
+    # ``HG=F``, ``MGC=F``). The underlying asset classes differ, so the
+    # patterns route to different markets. Both must come BEFORE any
+    # length-based fallback to win over the catch-all US-equity regex below.
+    # The ``=X`` width stays {3,6} as it was on main: this PR only asserts
+    # 6-character pairs, so narrowing it to {6} would drop shorter forms
+    # already covered here for no gain.
+    (re.compile(r"^[A-Z]{3,6}=X$", re.I), "forex"),
+    (re.compile(r"^[A-Z]{2,5}=F$", re.I), "futures"),
+    # Bare 6-character precious-metal / FX symbols (``XAUUSD``, ``XAGUSD``,
+    # ``XPTUSD``, ``XPDUSD``, ``EURUSD``, ``GBPUSD``, ``USDJPY``, ``USDCHF``,
+    # ``AUDUSD``, ``NZDUSD``, ``USDCAD``). Whitelist-restricted to a small
+    # set of base codes so legitimate US tickers of any 6-letter length are
+    # never re-routed. The four metal codes are ISO 4217; the rest are G10
+    # currencies. Length-only patterns (``^[A-Z]{6}$``) are deliberately
+    # rejected — they over-match tickers like ``NFLXLI`` or ``AMZNLY``.
+    (re.compile(
+        r"^(?:XAU|XAG|XPT|XPD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|USD)[A-Z]{3}$",
+        re.I,
+    ), "forex"),
     # Yahoo index symbols (^SPX, ^NDX, ^FTSE, ^VIX, ...) — served verbatim,
     # same as the =F/=X conventions. Classified as their own market so they
-    # never route through an equity/China chain or a cash currency.
+    # never route through an equity/China chain or a cash currency. Kept from
+    # main: this PR's branch point predates it.
     (re.compile(r"^\^[A-Za-z0-9.\-]+$"), "index"),
     # Bare US tickers (AAPL, MSFT, SPY, T, ...). Must stay LAST so every
     # suffixed equity / futures / crypto / forex form above wins first.
     # ``{1,5}`` covers every standard US ticker length while 6-char bare
-    # forex (EURUSD) and longer crypto codes (BTCUSDT) fall through to the
-    # a_share default.
+    # forex/metals (now caught by the whitelist above) and longer crypto
+    # codes (``BTCUSDT``) fall through to the a_share default.
     (re.compile(r"^[A-Z]{1,5}$", re.I), "us_equity"),
 ]
 
@@ -162,6 +183,9 @@ def _detect_market(code: str) -> str:
         Market type (a_share/us_equity/hk_equity/india_equity/kr_equity/
         ca_equity/crypto/futures/forex).
         Bare 1-5 letter alphabetic tickers resolve to ``us_equity``;
+        bare 6-letter codes that start with a precious-metal or G10
+        currency code (whitelist) resolve to ``forex``; Yahoo's
+        ``=F`` (futures) and ``=X`` (forex) notations are recognized;
         any other unknown format defaults to ``a_share``.
     """
     for pattern, market in _MARKET_PATTERNS:

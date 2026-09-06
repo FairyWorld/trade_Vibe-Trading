@@ -422,6 +422,9 @@ class AgentTuningConfig(_EnvBase):
     vibe_trading_enable_scheduler: EnvBool = Field(
         alias="VIBE_TRADING_ENABLE_SCHEDULER", default=False,
     )
+    vibe_contextual_identity_constraints: EnvBool = Field(
+        alias="VIBE_CONTEXTUAL_IDENTITY_CONSTRAINTS", default=True,
+    )
     vibe_trading_scheduler_max_consecutive_failures: int = Field(
         alias="VIBE_TRADING_SCHEDULER_MAX_CONSECUTIVE_FAILURES", default=3,
     )

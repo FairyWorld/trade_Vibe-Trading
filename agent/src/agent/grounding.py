@@ -32,6 +32,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from src.market_data import canonical_fx_pair
 
+from src.agent.resolution_context import (
+    IdentityConstraint,
+    ResolutionContext,
+    candidate_market,
+)
+
 
 GROUNDING_ARTIFACT = "grounding_evidence.json"
 
@@ -156,11 +162,33 @@ _GENERIC_PRICE_FIELD_ALIASES = {
 # Project-style canonical symbols. A bare model-generated ticker is still
 # checked when it appears under a symbol argument key, but it is not accepted
 # as user-provided identity because it lacks venue information.
+#
+# A joined crypto pair (``BTCUSDT``, ``ETHUSDT`` …) is recognized alongside
+# the dashed/slashed form so a user message like ``Get BTCUSDT spot price``
+# seeds an asserted identity and the asserted-symbol conflict check at
+# ``_ingest_resolution`` runs against it. The base is restricted to alpha
+# so a numeric prefix cannot masquerade as a joined pair, and the suffix
+# list is the unambiguous stablecoin set (``USDT`` / ``USDC`` / ``BUSD`` /
+# ``TUSD``) — ``USD`` is excluded because too many non-crypto strings end
+# in those three letters and over-matching would lock the wrong identity.
+_JOINED_CRYPTO_QUOTE_SUFFIXES = ("USDT", "USDC", "BUSD", "TUSD")
+# Spot precious metals quoted in USD collide with the TUSD suffix: XPTUSD is
+# XPT + USD (platinum), but stripping "TUSD" leaves the alpha base "XP" and
+# folds it to XP-TUSD — a crypto pair that does not exist, and the same class
+# of misresolution the USD exclusion above exists to prevent. XAU/XAG/XPD do
+# not collide today; they are listed together because they are the same kind
+# of symbol and a future suffix would collide with them the same way.
+_METAL_USD_PAIR_RE = re.compile(r"^(?:XAU|XAG|XPT|XPD)USD$", re.IGNORECASE)
+_JOINED_CRYPTO_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _CANONICAL_SYMBOL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"\d{3,6}\.(?:SH|SZ|BJ|SS|HK|KS|KQ)|"
     r"[A-Z][A-Z0-9&.-]{0,19}\.(?:US|NS|BO|FX|TO|V)|"
     r"[A-Z0-9]{2,15}(?:-|/)(?:USDT|USDC|USD|BTC|ETH)|"
+    r"[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")|"
     r"\^[A-Z0-9&.\-]{1,20}|"
     r"[A-Z0-9]{2,15}=[FX]"
     r")(?![A-Za-z0-9_])",
@@ -181,10 +209,25 @@ _PRIVATE_ASSERTION_RE = re.compile(
     r"(?:是|仍是|属于)(?:一家)?(?:私人|私营|非上市)公司|未上市|没有上市)",
     re.IGNORECASE,
 )
+# The bare verbs below are present tense only, which is not how an answer
+# actually states an observed price: "closed at 412.35" and "last traded at
+# 412.35" are the ordinary spellings and neither matches \bclose\b or
+# \btrade\b. Chinese 收盘 / 现价 match, so the gate was strictly leakier in
+# English than in Chinese — a fabricated USD price in the most natural
+# phrasing walked straight through while its Chinese translation was caught.
+# The past-tense forms are required to be followed by "at" so that reporting
+# volume ("traded 1.2M shares") or a corporate event ("the deal closed at a
+# 30% premium" — a percentage, already masked) is not read as a quote.
+_PRICE_VERB_PAST_RE = r"\b(?:closed|opened|traded|quoted|priced|settled|fixed)\s+at\b"
 _PRICE_CONTEXT_RE = re.compile(
     r"(?:\b(?:opening|open|high|low|closing|close|price|quote)\b|"
+    + _PRICE_VERB_PAST_RE + r"|"
     r"\b(?:entry|buy|target|support|resistance)\s+(?:price|level)\b|"
     r"开盘价?|最高价?|最低价?|收盘价?|买入价|入场价|目标价|支撑位?|阻力位?|"
+    # Chinese had the mirror-image gap: these four are as ordinary as 收盘价
+    # and none of them matched, so a fabricated 成交价 / 股价 walked through
+    # exactly the way "closed at" did in English.
+    r"成交价|最新价|股价|收报|"
     r"现价|报价|价格|价位)",
     re.IGNORECASE,
 )
@@ -255,6 +298,23 @@ _RANGE_TAIL = r"(?:\s*[-–—~～至到]\s*[-+]?\d[\d,]*(?:\.\d+)?)?"
 # (#983). Mask the span as a whole.
 _PERCENT_RANGE_RE = re.compile(
     r"\d[\d,]*(?:\.\d+)?\s*[-–—~至]\s*\d[\d,]*(?:\.\d+)?\s*[%％]"
+)
+# A percentage-POINT delta is not a quoted price. "~3.6pp below Penumbra"
+# describes a margin gap; left unmasked the ".6" is consumed as a decimal
+# and the number reaches the OHLC comparator, which then rejects an
+# otherwise correct fundamentals answer and demands `get_market_data` to
+# substantiate a claim that has nothing to do with price.
+# The trailing "%" spellings are already handled above; this covers the
+# percentage-point spellings, which the percent masks never matched.
+# The Chinese units take an optional measure word ("3.6 个百分点" is the
+# ordinary spelling; bare "3.6 百分点" is the rare one) and are matched
+# without a trailing \b: after a CJK character \b requires a non-word
+# character to follow, so "下降 3.6 个百分点后企稳" would not match. The
+# ASCII units keep \b, which is what stops "3.6ppm" being read as pp.
+_PERCENTAGE_POINT_RE = re.compile(
+    r"[-+~≈]?\s*\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:(?:pp|ppt|ppts|bps|bp)\b|个?(?:百分点|基点))",
+    re.IGNORECASE,
 )
 # Localized calendar text carries digits that the ISO pattern above leaves
 # behind: "8 月 3 日" otherwise contributes 8 and 3 as candidate prices.
@@ -451,10 +511,12 @@ _PROSPECTIVE_LEVEL_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-# Full-width brackets and enumeration commas delimit prose clauses. ASCII
-# parentheses are deliberately not separators: an explicit derivation such as
-# "(8.5 - 7.9) / 2" must stay in one segment for the formula check.
-_CLAUSE_SEPARATOR_RE = re.compile(r"[,，;；。、\n（）【】]")
+# Full-width enumeration commas delimit prose clauses. Paired brackets (ASCII
+# or full-width ()()[]) are deliberately not separators: an explicit
+# derivation such as "(8.5 - 7.9) / 2" must stay in one segment for the
+# formula check, and 公司名（代码）价格 must stay in one segment so the
+# unsourced-symbol gate can see the symbol with its figure (#1260).
+_CLAUSE_SEPARATOR_RE = re.compile(r"[,，;；。、\n]")
 
 
 # The ASCII comma both separates clauses and groups thousands, and the clause
@@ -569,8 +631,10 @@ def _normalize_symbol(value: Any) -> str:
     Returns:
         The canonical spelling — uppercased, with Shanghai's ``.SS`` alias
         folded onto ``.SH``, an exchange prefix rewritten as a suffix, a Hong
-        Kong code zero-padded, and a crypto pair hyphenated. Text that is not a
-        symbol is returned uppercased and otherwise untouched.
+        Kong code zero-padded, and a crypto pair hyphenated. A joined crypto
+        pair with no separator (``BTCUSDT``) is rewritten as the dashed form
+        (``BTC-USDT``) so every downstream check sees one identity. Text that
+        is not a symbol is returned uppercased and otherwise untouched.
     """
     # A fiat/fiat pair is one FX instrument regardless of spelling: ``GBP/USD``
     # and ``GBPUSD`` are both ``GBPUSD=X``. Checked BEFORE the slash is
@@ -590,6 +654,17 @@ def _normalize_symbol(value: Any) -> str:
         return f"{prefixed.group(2)}.{prefixed.group(1)}"
     base, dot, suffix = symbol.rpartition(".")
     if not dot:
+        # No separator at all: rewrite a joined crypto pair (``BTCUSDT``)
+        # as the dashed form so the dash/slash branch and the canonical
+        # regex both match. The base must be all-alpha so a numeric prefix
+        # cannot collide with another numeric-code branch downstream.
+        joined = _JOINED_CRYPTO_RE.fullmatch(symbol)
+        if joined and not _METAL_USD_PAIR_RE.fullmatch(symbol):
+            for quote in _JOINED_CRYPTO_QUOTE_SUFFIXES:
+                if symbol.endswith(quote) and len(symbol) > len(quote):
+                    base_part = symbol[: -len(quote)]
+                    if base_part.isalpha():
+                        return f"{base_part}-{quote}"
         return symbol
     if suffix == "SS":
         suffix = "SH"
@@ -883,6 +958,7 @@ class IdentityRecord:
     source_tool_call_id: str | None = None
     source: list[str] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    resolution_constraints: list[dict[str, Any]] = field(default_factory=list)
     version: int = 1
     updated_at: str = field(default_factory=_utc_now)
 
@@ -952,6 +1028,7 @@ class GroundingLedger:
         run_dir: Path,
         user_message: str,
         history: Sequence[Mapping[str, Any]] | None = None,
+        contextual_identity_constraints: bool = True,
     ) -> None:
         """Create a ledger and seed only authoritative prior identities.
 
@@ -959,12 +1036,19 @@ class GroundingLedger:
             run_dir: Active run directory.
             user_message: Current user request.
             history: Optional prior message history. It remains available to
-                the model, but is deliberately not an authorization source for
-                this run: stale identities from an earlier user subject must
-                not unlock a new subject's tools.
+                the model. Only explicit constraints whose clause names the
+                current resolver subject may carry forward; stale global
+                instructions cannot authorize a new subject.
+            contextual_identity_constraints: Whether explicit market words in
+                the original conversation may narrow resolver candidates.
         """
         self.run_dir = Path(run_dir)
         self.user_message = user_message
+        self.resolution_context = ResolutionContext.from_messages(
+            user_message,
+            history,
+            enabled=contextual_identity_constraints,
+        )
         self._identities: dict[str, IdentityRecord] = {}
         self._evidence: list[EvidenceRecord] = []
         self._tool_failures: list[dict[str, Any]] = []
@@ -1594,6 +1678,9 @@ class GroundingLedger:
 
         raw_candidates = data.get("candidates")
         candidates = [dict(item) for item in raw_candidates if isinstance(item, dict)] if isinstance(raw_candidates, list) else []
+        resolver_candidates = candidates
+        relevant_constraints = self.resolution_context.constraints_for(query)
+        constraint_audit = [item.audit_record() for item in relevant_constraints]
         sources = data.get("sources") if isinstance(data.get("sources"), dict) else {}
         if not candidates:
             # "This entity does not exist" may only be concluded when every
@@ -1619,9 +1706,37 @@ class GroundingLedger:
                 source_tool_call_id=call_id,
                 source=clean_sources,
                 candidates=[],
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
+
+        market_values = {
+            item.value
+            for item in relevant_constraints
+            if item.dimension == "market" and item.explicit
+        }
+        if market_values:
+            constrained = [
+                candidate
+                for candidate in candidates
+                if candidate_market(candidate) in market_values
+            ]
+            if constrained:
+                candidates = constrained
+            else:
+                # A mismatch with an explicit constraint must stay fail closed.
+                # The candidate list may be truncated, so this is ambiguity,
+                # not proof that the requested listing does not exist.
+                self._identities[key] = IdentityRecord(
+                    query=query,
+                    status="ambiguous",
+                    source_tool_call_id=call_id,
+                    candidates=resolver_candidates,
+                    resolution_constraints=constraint_audit,
+                    version=version,
+                )
+                return
 
         chosen = self._choose_candidate(query, candidates)
         if chosen is None:
@@ -1629,7 +1744,8 @@ class GroundingLedger:
                 query=query,
                 status="ambiguous",
                 source_tool_call_id=call_id,
-                candidates=candidates,
+                candidates=resolver_candidates,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1640,7 +1756,8 @@ class GroundingLedger:
                 query=query,
                 status="invalidated",
                 source_tool_call_id=call_id,
-                candidates=candidates,
+                candidates=resolver_candidates,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1660,6 +1777,7 @@ class GroundingLedger:
                 status="conflicting",
                 source_tool_call_id=call_id,
                 candidates=conflicting,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1672,6 +1790,7 @@ class GroundingLedger:
                 status="conflicting",
                 source_tool_call_id=call_id,
                 candidates=conflicting,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1691,7 +1810,8 @@ class GroundingLedger:
             currency=_infer_currency(symbol),
             source_tool_call_id=call_id,
             source=source_names,
-            candidates=candidates,
+            candidates=resolver_candidates,
+            resolution_constraints=constraint_audit,
             version=version,
         )
         self._supersede_shortlists(symbol)
@@ -1966,8 +2086,9 @@ class GroundingLedger:
             )
         source = str(payload.get("source") or tool_name)
         remaining = _MAX_GENERIC_EVIDENCE
+        timestamp_fields = (*_TIMESTAMP_FIELDS, "as_of")
 
-        def visit(value: Any, path: str) -> None:
+        def visit(value: Any, path: str, timestamp: str | None = None) -> None:
             nonlocal remaining
             if remaining <= 0:
                 return
@@ -1978,7 +2099,7 @@ class GroundingLedger:
                         tool=tool_name,
                         symbol=symbol,
                         source=source,
-                        timestamp=None,
+                        timestamp=timestamp,
                         field=path or "value",
                         value=value,
                         status="observed",
@@ -1989,11 +2110,25 @@ class GroundingLedger:
                 remaining -= 1
                 return
             if isinstance(value, dict):
+                local_timestamp = next(
+                    (
+                        str(value[key])
+                        for key in timestamp_fields
+                        if value.get(key) is not None
+                    ),
+                    timestamp,
+                )
                 for key, item in value.items():
-                    visit(item, f"{path}.{key}" if path else str(key))
+                    if str(key).casefold() in timestamp_fields:
+                        continue
+                    visit(
+                        item,
+                        f"{path}.{key}" if path else str(key),
+                        local_timestamp,
+                    )
             elif isinstance(value, list):
                 for index, item in enumerate(value):
-                    visit(item, f"{path}[{index}]")
+                    visit(item, f"{path}[{index}]", timestamp)
 
         visit(payload, "")
 
@@ -2531,6 +2666,7 @@ class GroundingLedger:
         masked = _SHORT_DATE_RE.sub(" ", masked)
         masked = _DASH_DATE_RE.sub(" ", masked)
         masked = _PERCENT_RANGE_RE.sub(" ", masked)
+        masked = _PERCENTAGE_POINT_RE.sub(" ", masked)
         masked = _ORDER_LEVEL_RE.sub(" ", masked)
         masked = _AGGREGATE_AMOUNT_RE.sub(" ", masked)
         masked = _LABELLED_SCORE_RE.sub(" ", masked)
@@ -2663,7 +2799,9 @@ class GroundingLedger:
 __all__ = [
     "GROUNDING_ARTIFACT",
     "GroundingLedger",
+    "IdentityConstraint",
     "IdentityRecord",
+    "ResolutionContext",
     "ToolAuthorization",
     "ValidationResult",
 ]

@@ -46,6 +46,14 @@ class TestDetectMarket:
             ("AAPL.US", "us_equity"),
             ("TSLA.US", "us_equity"),
             ("NVDA.US", "us_equity"),
+            # US equity — dotted class shares in the .US form (BRK.B, BF.A,
+            # RDS.A) must not fall through to the a_share default.
+            ("BRK.B.US", "us_equity"),
+            ("BRK.A.US", "us_equity"),
+            ("BF.B.US", "us_equity"),
+            ("RDS.A.US", "us_equity"),
+            ("WRB.B.US", "us_equity"),
+            ("LEN.B.US", "us_equity"),
             # US equity — bare tickers without the .US suffix (issue #986)
             ("AAPL", "us_equity"),
             ("MSFT", "us_equity"),
@@ -101,13 +109,19 @@ class TestDetectMarket:
         assert _detect_market("aapl") == "us_equity"
         assert _detect_market("btc-usdt") == "crypto"
         assert _detect_market("td.to") == "ca_equity"
+        assert _detect_market("brk.b.us") == "us_equity"
 
     def test_unknown_defaults_to_a_share(self) -> None:
+        # Symbols that don't match any pattern fall through to the
+        # ``a_share`` default. ``EURUSD`` and ``BTCUSDT`` used to be
+        # examples but are now classified (PR #1280); use truly
+        # unclassifiable inputs so the default-to-``a_share`` behavior
+        # is pinned without coupling to a specific routing decision.
         assert _detect_market("UNKNOWN") == "a_share"
         assert _detect_market("random-string") == "a_share"
-        # Bare codes outside the 1-5 letter US shape keep the old default.
-        assert _detect_market("EURUSD") == "a_share"
-        assert _detect_market("BTCUSDT") == "a_share"
+        assert _detect_market("12345") == "a_share"
+        assert _detect_market("123456") == "a_share"
+        assert _detect_market("@#$") == "a_share"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +148,17 @@ class TestBareUsTickerRouting:
         assert _detect_source("AAPL") == "yfinance"
         assert code_currency("AAPL") == "USD"
         assert code_currency("AAPL.US") == "USD"
+
+    def test_dotted_class_share_source_and_currency(self) -> None:
+        """Dotted class shares must route to USD + yfinance, not CNY/tushare."""
+        for code in ("BRK.B.US", "BRK.A.US", "BF.B.US"):
+            assert _detect_source(code) == "yfinance", code
+            assert code_currency(code) == "USD", code
+
+    def test_dotted_class_share_groups_with_other_us_equities(self) -> None:
+        basket = ["BRK.B.US", "AAPL.US"]
+        groups = _group_codes_by_market(basket)
+        assert groups == {"us_equity": basket}
 
     def test_canadian_tickers_route_to_canada_and_cad(self) -> None:
         assert _detect_source("TD.TO") == "yahoo"
@@ -326,3 +351,40 @@ class TestDetectMarketRequired:
 
     def test_crypto_hyphen_form(self) -> None:
         assert _detect_market("BTC-USDT") == "crypto"
+
+    def test_bare_fx_pair_classifies_as_forex(self) -> None:
+        # Bare 6-character G10 / precious-metal pairs. PR #1280 added
+        # the whitelist-restricted regex so ``XAUUSD`` / ``EURUSD`` route
+        # to ``forex`` instead of falling through to the ``a_share``
+        # default. The test pins the new behavior explicitly.
+        assert _detect_market("XAUUSD") == "forex"
+        assert _detect_market("EURUSD") == "forex"
+        assert _detect_market("XAGUSD") == "forex"
+        assert _detect_market("XPTUSD") == "forex"
+        assert _detect_market("XPDUSD") == "forex"
+        assert _detect_market("GBPUSD") == "forex"
+        assert _detect_market("USDJPY") == "forex"
+
+    def test_yahoo_equals_notation_routes_to_underlying_market(self) -> None:
+        # Yahoo's continuous-front-month futures form (``=F``) and forex
+        # form (``=X``). PR #1280 added these patterns.
+        assert _detect_market("GC=F") == "futures"
+        assert _detect_market("CL=F") == "futures"
+        assert _detect_market("SI=F") == "futures"
+        assert _detect_market("HG=F") == "futures"
+        assert _detect_market("MGC=F") == "futures"
+        assert _detect_market("XAUUSD=X") == "forex"
+        assert _detect_market("EURUSD=X") == "forex"
+
+    def test_bare_fx_pair_classification_is_case_insensitive(self) -> None:
+        # The bare-6-character regex in ``_MARKET_PATTERNS`` is compiled
+        # with ``re.I``. This is the same case-insensitive convention the
+        # project has always used for symbol matching (see also
+        # ``test_case_insensitive``), so ``eurusd`` / ``xauusd`` resolving
+        # as ``forex`` is intentional rather than incidental.
+        assert _detect_market("eurusd") == "forex"
+        assert _detect_market("xauusd") == "forex"
+        assert _detect_market("gbpusd") == "forex"
+        assert _detect_market("usdjpy") == "forex"
+        assert _detect_market("gc=f") == "futures"
+        assert _detect_market("eurusd=x") == "forex"

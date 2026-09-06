@@ -14,6 +14,8 @@ from src.agent.grounding import (
     GroundingLedger,
     _infer_currency,
     _infer_venue,
+    _JOINED_CRYPTO_RE,
+    _normalize_symbol,
     _scan_symbols,
     _symbol_from_csv_filename,
     _timestamp_matches_claim_date,
@@ -363,6 +365,13 @@ def test_bare_ticker_stays_blocked_when_it_names_more_than_one_identity(
         ("00700.HK", "700.HK"),
         ("00700.HK", "0700.HK"),
         ("BTC-USDT", "BTC/USDT"),
+        # Joined crypto pairs (no separator) are the same identity as the
+        # dashed/slashed spelling. Without this normalization, a ``BTCUSDT``
+        # argument against a locked ``BTC-USDT`` is rejected as
+        # ``identity_mismatch`` by ``_match_authorized_symbol``.
+        ("BTC-USDT", "BTCUSDT"),
+        ("ETH-USDT", "ETHUSDT"),
+        ("BTC-USDC", "BTCUSDC"),
     ],
 )
 def test_provider_spellings_of_one_instrument_are_one_identity(
@@ -382,6 +391,84 @@ def test_provider_spellings_of_one_instrument_are_one_identity(
 
     assert ledger.authorized_symbols == {locked}
     assert authorization.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The four unambiguous stablecoin suffixes, with several bases.
+        ("BTCUSDT", "BTC-USDT"),
+        ("ETHUSDT", "ETH-USDT"),
+        ("SOLUSDT", "SOL-USDT"),
+        ("BTCUSDC", "BTC-USDC"),
+        ("BTCBUSD", "BTC-BUSD"),
+        ("ETHTUSD", "ETH-TUSD"),
+        ("btcusdt", "BTC-USDT"),  # case-insensitive
+        # Edge: the suffix alone is too short to split (the base must have
+        # at least one character).
+        ("USDT", "USDT"),
+        ("USDC", "USDC"),
+        # Edge: a numeric prefix is not a crypto base.
+        ("123USDT", "123USDT"),
+        # Negatives: existing shapes must be untouched.
+        ("BTC-USDT", "BTC-USDT"),
+        ("BTC/USD", "BTC-USD"),
+        ("VALOUR-BTC-0-SEK.ST", "VALOUR-BTC-0-SEK.ST"),
+        ("AAPL.US", "AAPL.US"),
+        ("600519.SH", "600519.SH"),
+    ],
+)
+def test_normalize_joined_crypto_pairs(raw: str, expected: str) -> None:
+    """A joined crypto pair (no separator) normalizes to its dashed form."""
+    assert _normalize_symbol(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("BTCUSDT", {"BTC-USDT"}),
+        ("BTCUSDT spot price", {"BTC-USDT"}),
+        ("ETH/USDT latest price", {"ETH-USDT"}),
+        ("BTC-USDT close", {"BTC-USDT"}),
+        ("BTCUSDT, ETH-USDT, BTC-USD", {"BTC-USDT", "ETH-USDT", "BTC-USD"}),
+    ],
+)
+def test_scan_symbols_detects_joined_pairs(text: str, expected: set[str]) -> None:
+    """A bare joined crypto pair is scanned as the canonical symbol."""
+    assert _scan_symbols(text) == expected
+
+
+# The other arm of the same decision, pinned as two mechanisms because it is
+# two mechanisms. Nothing covered either of them: adding "USD" back to the
+# suffix list passed every other test in this file while folding spot gold to
+# XAU-USD, the exact tokenized-gold misresolution #1282 exists to stop.
+#
+# 1. Bare "USD" is kept out of the suffix list, so an FX or metal pair never
+#    matches the joined-pair regex in the first place.
+@pytest.mark.parametrize("raw", ["XAUUSD", "XAGUSD", "XPDUSD", "EURUSD", "GBPUSD"])
+def test_bare_usd_quote_never_matches_the_joined_pair_regex(raw: str) -> None:
+    assert _JOINED_CRYPTO_RE.fullmatch(raw) is None
+    assert "-USD" not in _normalize_symbol(raw)
+
+
+# 2. XPTUSD is the case the suffix list alone cannot catch: it is XPT + USD
+#    (platinum), but it also ends in "TUSD", so the regex DOES match and the
+#    alpha base "XP" passes the isalpha guard. Without the metal-pair check it
+#    normalizes to XP-TUSD — a crypto pair that does not exist. FX pairs have
+#    canonical_fx_pair as a second line of defence; XAU/XPT are metal codes,
+#    not fiat codes, so they have none.
+def test_metal_usd_pair_is_not_split_on_the_tusd_suffix() -> None:
+    assert _JOINED_CRYPTO_RE.fullmatch("XPTUSD") is not None, (
+        "precondition: the regex does match, which is why the guard is needed"
+    )
+    assert _normalize_symbol("XPTUSD") == "XPTUSD"
+
+
+# ...and the guard must not swallow genuine pairs quoted in TrueUSD.
+def test_genuine_tusd_pairs_still_fold() -> None:
+    assert _normalize_symbol("LINKTUSD") == "LINK-TUSD"
+    assert _normalize_symbol("ADABUSD") == "ADA-BUSD"
+    assert _normalize_symbol("OPUSDT") == "OP-USDT"
 
 
 def test_binance_pair_resolution_authorizes_crypto_consumers(tmp_path: Path) -> None:
@@ -2062,6 +2149,134 @@ def test_an_unevidenced_price_is_still_rejected_without_any_tool_call(
     assert {"numeric_claim_unavailable", "unsourced_symbol_figures"} & {
         issue["code"] for issue in result.issues
     }
+
+
+@pytest.mark.parametrize(
+    ("draft", "paren_width"),
+    [
+        ("同期五粮液（000858.SZ）收 168.50 元。", "full-width"),
+        ("同期五粮液(000858.SZ)收 168.50 元。", "half-width"),
+    ],
+)
+def test_fullwidth_parentheses_do_not_split_symbol_from_figure(
+    tmp_path: Path,
+    draft: str,
+    paren_width: str,
+) -> None:
+    """#1260: 公司名（代码）价格 must stay in one clause for the gate.
+
+    Full-width （） were treated as clause separators, so the symbol landed in
+    one segment and the figure in the next and the unsourced-symbol gate
+    never saw them together — a false negative that flipped on parenthesis
+    width alone. Both widths must fire now; the half-width form is the
+    control that already passed.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="What is Kweichow Moutai (600519.SH) trading at this week?",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={
+            "codes": ["600519.SH"],
+            "start_date": "2026-08-24",
+            "end_date": "2026-08-28",
+            "source": "baostock",
+        },
+        result=json.dumps(
+            {
+                "600519.SH": [
+                    {
+                        "trade_date": "2026-08-28T00:00:00",
+                        "open": 1289.0,
+                        "high": 1297.89,
+                        "low": 1288.0,
+                        "close": 1297.4,
+                        "volume": 16126.11,
+                    }
+                ],
+                "_provenance": {
+                    "600519.SH": {
+                        "source": "baostock",
+                        "fallback_used": False,
+                        "currency_conversion": "none",
+                        "volume_unit": "lots",
+                    }
+                },
+            }
+        ),
+        call_id="c1",
+        success=True,
+    )
+
+    issues = [
+        issue
+        for issue in ledger.validate_final_answer(draft).issues
+        if issue.get("code") == "unsourced_symbol_figures"
+    ]
+
+    assert issues, f"{paren_width} parentheses must fire unsourced_symbol_figures"
+    # Pin the offending symbol, not just "some issue fired": the gate must
+    # blame the unsourced 000858.SZ, not the sourced 600519.SH.
+    assert [issue["symbol"] for issue in issues] == ["000858.SZ"]
+
+
+def test_unsourced_symbol_without_a_figure_stays_silent(tmp_path: Path) -> None:
+    """#1260 guard arm: figure co-presence is what the gate checks.
+
+    The regression test above pins that the gate fires when symbol and figure
+    share a clause. This arm pins the inverse: an unsourced symbol with NO
+    nearby figure must not fire unsourced_symbol_figures, so the gate's
+    figure-presence guard (_numbers_without_dates_or_percent) cannot be
+    dropped without this test failing.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="What is Kweichow Moutai (600519.SH) trading at this week?",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={
+            "codes": ["600519.SH"],
+            "start_date": "2026-08-24",
+            "end_date": "2026-08-28",
+            "source": "baostock",
+        },
+        result=json.dumps(
+            {
+                "600519.SH": [
+                    {
+                        "trade_date": "2026-08-28T00:00:00",
+                        "open": 1289.0,
+                        "high": 1297.89,
+                        "low": 1288.0,
+                        "close": 1297.4,
+                        "volume": 16126.11,
+                    }
+                ],
+                "_provenance": {
+                    "600519.SH": {
+                        "source": "baostock",
+                        "fallback_used": False,
+                        "currency_conversion": "none",
+                        "volume_unit": "lots",
+                    }
+                },
+            }
+        ),
+        call_id="c1",
+        success=True,
+    )
+
+    issues = [
+        issue
+        for issue in ledger.validate_final_answer(
+            "同期五粮液（000858.SZ）是知名白酒企业。"
+        ).issues
+        if issue.get("code") == "unsourced_symbol_figures"
+    ]
+
+    assert issues == []
 
 
 def test_a_shortlist_answers_the_user_but_still_cannot_fetch_a_quote(
