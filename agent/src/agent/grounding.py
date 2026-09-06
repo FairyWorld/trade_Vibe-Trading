@@ -369,10 +369,6 @@ _DERIVATION_RE = re.compile(
 # arithmetic on sourced inputs, not an invented backtest metric (#1338
 # review). The frame alone never grounds anything — the values must also
 # match an observed endpoint pair exactly (see _return_derived_from_observed).
-_GROWTH_FRAME_RE = re.compile(
-    r"从[^，。;；\n]{0,60}?(?:到|至)|\bfrom\b[^,;。\n]{0,80}?\bto\b",
-    re.IGNORECASE,
-)
 _NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     r"(?![A-Za-z0-9_])"
@@ -2795,8 +2791,11 @@ class GroundingLedger:
                         line, price_records, line_symbol
                     ):
                         continue
-                    if _GROWTH_FRAME_RE.search(line) and self._return_derived_from_observed(
-                        unsupported, price_records, line_symbol
+                    operands = self._observed_operands_in_line(
+                        line, price_records, line_symbol
+                    )
+                    if len(operands) >= 2 and self._return_derived_from_observed(
+                        unsupported, price_records, line_symbol, operands=operands
                     ):
                         continue
                 issues.append(
@@ -2890,11 +2889,48 @@ class GroundingLedger:
 
         return any(close(candidate, item) for candidate in candidates for item in observed)
 
+    def _observed_operands_in_line(
+        self,
+        line: str,
+        records: Sequence[EvidenceRecord],
+        symbol: str | None,
+    ) -> list[float]:
+        """Observed values that literally appear as numbers in this clause.
+
+        This is the structural half of the derivation exemption. Keying it on
+        a growth PHRASE ("从…到" / "from…to") made the gate stricter for every
+        wording the list happened to miss, which is the same per-language
+        drift that ``test_grounding_language_parity`` exists to stop: the
+        Chinese "第一日收盘 100.0 美元，第二日收盘 112.4 美元，收益率 12.4%"
+        states the identical derivation and was rejected. Requiring the
+        operands themselves to be present and sourced is language-independent
+        and strictly narrower than a phrase list, because a bare
+        "cumulative return of 12.4%" carries no operands at all.
+        """
+        candidates = [record for record in records if record.value is not None]
+        if symbol:
+            candidates = [record for record in candidates if record.symbol == symbol]
+        observed = {float(record.value) for record in candidates}
+        if not observed:
+            return []
+        present: set[float] = set()
+        for raw in self._numbers_without_dates_or_percent(line):
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            for candidate in observed:
+                if abs(value - candidate) <= max(abs(candidate) * 1e-9, 1e-9):
+                    present.add(candidate)
+        return sorted(present)
+
     def _return_derived_from_observed(
         self,
         claimed: Sequence[str],
         records: Sequence[EvidenceRecord],
         symbol: str | None,
+        *,
+        operands: Sequence[float] | None = None,
     ) -> bool:
         """True when a return figure equals growth between observed endpoints.
 
@@ -2904,10 +2940,15 @@ class GroundingLedger:
         figure; the caller must already have verified the from/to frame, so a
         bare unanchored return claim never reaches here.
         """
-        candidates = [record for record in records if record.value is not None]
-        if symbol:
-            candidates = [record for record in candidates if record.symbol == symbol]
-        observed = sorted({float(record.value) for record in candidates})
+        if operands is not None:
+            observed = sorted(set(operands))
+        else:
+            candidates = [record for record in records if record.value is not None]
+            if symbol:
+                candidates = [
+                    record for record in candidates if record.symbol == symbol
+                ]
+            observed = sorted({float(record.value) for record in candidates})
         if len(observed) < 2:
             return False
         values: list[float] = []
@@ -2968,16 +3009,13 @@ class GroundingLedger:
                 )
                 if self._is_explicit_derivation(segment, records, symbol):
                     continue
-                # An attributed figure ("The paper reports TSLA.US traded at
-                # 412.35") is a citation, not an invented price — skip the
-                # price gate too, for the same reason as the analysis and
-                # unsourced-symbol gates. Without this, an attributed price
-                # is rejected or accepted purely on whether its verb happens
-                # to match _PRICE_CONTEXT_RE ("reports" does, "estimate"
-                # doesn't), which is the exact vocabulary asymmetry under
-                # review.
-                if _ATTRIBUTION_RE.search(segment):
-                    continue
+                # NO attribution exemption here, deliberately. A paper's
+                # Sharpe is a figure this run could never have observed, so
+                # citing it is legitimate; a PRICE is exactly what this run
+                # does observe, so "analysts say TSLA.US last traded at
+                # 412.35" is the laundering shape this gate exists to catch —
+                # adding a citation subject must not buy a fabricated quote a
+                # way through. The exemption stays in the analysis gate only.
                 for value in values:
                     issue = self._compare_price_claim(
                         value=value,

@@ -3371,3 +3371,74 @@ def test_attribution_exemption_cannot_launders_self_claims(tmp_path: Path) -> No
             answer,
             issues,
         )
+
+
+def test_attribution_never_exempts_a_price_claim(tmp_path: Path) -> None:
+    """A citation subject must not launder a fabricated quote.
+
+    The attribution exemption is legitimate in the ANALYSIS gate — a paper's
+    Sharpe is a figure this run could never have observed. A price is the
+    opposite: it is exactly what this run observes, so attributing it to a
+    source is the laundering shape the price gate exists to catch. With the
+    exemption applied to `_validate_price_claims`, every line below passed
+    with zero tool evidence.
+    """
+    for answer in (
+        "Analysts say TSLA.US last traded at 412.35 USD.",
+        "分析师指出特斯拉现价 412.35 美元。",
+        "The paper reports that AAPL.US closed at 189.20.",
+        "据研究机构报告，AAPL.US 收盘价为 189.20。",
+        "The filing reports the stock closed at 412.35.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Quote the price.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert issues, f"attributed price accepted with zero evidence: {answer}"
+
+
+def test_derived_return_exemption_is_structural_not_phrasal(tmp_path: Path) -> None:
+    """The same derivation must get the same verdict in both languages.
+
+    Keying the exemption on a growth PHRASE ("从…到" / "from…to") made the
+    gate stricter for every wording the list missed. The pairs below state the
+    identical arithmetic on the identical observed endpoints; asserting the
+    two verdicts are EQUAL is what stops the next patch moving the breakage to
+    the other language, exactly as test_grounding_language_parity does.
+    """
+
+    def verdict(answer: str) -> bool:
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="AAPL.US 走势")
+        ledger.ingest_tool_result(
+            tool_name="get_market_data",
+            arguments={"codes": ["AAPL.US"]},
+            result=json.dumps(
+                {
+                    "AAPL.US": [
+                        {"trade_date": "2026-08-03", "close": 100.0},
+                        {"trade_date": "2026-09-02", "close": 112.4},
+                    ]
+                }
+            ),
+            call_id="quote",
+            success=True,
+        )
+        return bool(ledger.validate_final_answer(answer).issues)
+
+    # Accepted in both: operands present in the clause and sourced.
+    for english, chinese in (
+        (
+            "AAPL.US rose from 100.0 to 112.4, a cumulative return of 12.4%.",
+            "AAPL.US 第一日收盘 100.0 美元，第二日收盘 112.4 美元，收益率 12.4%。",
+        ),
+    ):
+        en, zh = verdict(english), verdict(chinese)
+        assert en == zh, f"verdicts disagree by language: EN={en} ZH={zh}"
+        assert en is False, f"sourced derivation rejected: {english}"
+
+    # Still rejected in both: no operands in the clause, or wrong arithmetic.
+    for answer in (
+        "AAPL.US delivered a cumulative return of 12.4% over the window.",
+        "AAPL.US 区间收益率为 12.4%。",
+        "AAPL.US rose from 100.0 to 112.4, a cumulative return of 15.0%.",
+        "AAPL.US 从 100.0 涨到 112.4，区间收益率为 15.0%。",
+    ):
+        assert verdict(answer) is True, f"unanchored/wrong return accepted: {answer}"
