@@ -484,7 +484,6 @@ def compute_evidence_for_run(
             unlabeled_trades,
         )
 
-    resolved_size = _resolve_position_size(position_size, exposures)
     breakeven_caveat = _breakeven_caveat(max_concurrent)
     last_verified = (
         today if isinstance(today, str) and today else date.today().isoformat()
@@ -500,12 +499,16 @@ def compute_evidence_for_run(
         if trades_in_regime < 1:
             continue
         bar_indices = [i for i, label in enumerate(regime_per_bar) if label == regime]
+        regime_exposures = [
+            value for i in bar_indices if (value := exposures[i]) is not None
+        ]
+        resolved_size = _resolve_position_size(position_size, regime_exposures)
 
         strategy_returns = _bar_returns(bar_indices, equities)
         compounded_return = _compounded(strategy_returns)
 
         benchmark_compounded: float | None = None
-        if all(value is not None for value in benchmarks):
+        if all(benchmarks[i] is not None for i in bar_indices):
             benchmark_returns = _bar_returns(bar_indices, benchmarks)  # type: ignore[arg-type]
             benchmark_compounded = _compounded(benchmark_returns)
         excess = (
