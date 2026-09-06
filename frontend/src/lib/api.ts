@@ -957,11 +957,16 @@ export interface RebalanceNotesPayload {
     top_moves?: Array<{ code: string; from: number; to: number; delta: number }>;
   }>;
   summary?: {
-    rebalance_count: number;
+    target_change_count: number;
+    /** Legacy key on runs produced before the #1275 execution-evidence fix. */
+    rebalance_count?: number;
     turnover_total: number;
     turnover_mean: number;
     turnover_max: number;
     largest_rebalance_date?: string | null;
+    rebalance_executed_bars?: number;
+    rebalance_executed_fills?: number;
+    rebalance_realized_turnover?: number;
   };
 }
 

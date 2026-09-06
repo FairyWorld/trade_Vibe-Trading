@@ -55,7 +55,10 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-multipart>=0.0.18",
     "sse-starlette>=1.6.0",
-    "fastmcp>=2.14.0",
+    # 4.0.0 changed MCPError's constructor (message is now separate) and the
+    # session snapshot shape; tests construct it the 2.x way. Cap until the
+    # adaptation lands.
+    "fastmcp>=2.14.0,<4.0.0",
     "ddgs>=6.0.0",
     "jinja2>=3.1.0",
     "matplotlib>=3.7.0",
@@ -110,6 +113,12 @@ mt5 = [
     # (broker connector + mt5 data loader). Lazy-imported; on other platforms
     # the marker makes this a no-op and everything degrades gracefully.
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+]
+zerodha = [
+    # Zerodha Kite Connect (India NSE/BSE) broker connector + india_broker
+    # loader backend. Lazy-imported with a named error; zerodha_available()
+    # stays False (loader falls through to Shoonya/Dhan) until installed.
+    "kiteconnect>=4.0.0",
 ]
 deepseek = [
     "langchain-deepseek>=1.0.0,<2",

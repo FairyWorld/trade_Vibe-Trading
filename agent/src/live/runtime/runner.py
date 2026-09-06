@@ -48,7 +48,7 @@ from src.live.runtime.flatten import flatten_and_cancel
 from src.live.runtime.jobstore import JobStore
 from src.live.runtime.sweep_latch import (
     claim_sweep,
-    halt_episode,
+    halt_snapshot,
     mark_sweep_fired,
     release_claim,
     sweep_already_fired,
@@ -652,15 +652,21 @@ class LiveRunner:
         """
         if self._flatten_fired or self._submit_fn is None:
             return
-        if sweep_already_fired(self.broker):
+        # Capture ONE coherent halt snapshot before claiming. The claim, the
+        # already-fired check, the latch write and the release must all bind
+        # to the SAME view of the halt state: re-reading the sentinels later
+        # would let a mid-sweep clear/re-trip record an episode whose sweep
+        # never ran (next runner would skip it — positions stay open).
+        active_episodes, episode = halt_snapshot(self.broker)
+        episode = episode or "unknown"
+        if sweep_already_fired(self.broker, episode):
             self._flatten_fired = True
             return
-        # Resolve the episode ONCE: the claim and its release in ``finally``
-        # must refer to the same episode. Re-resolving at release time can
-        # bind to a NEWER episode (halt cleared + re-tripped mid-sweep) and
-        # delete that episode's claim — even a different process's — which
-        # would unprotect a concurrent sweep of the new episode.
-        episode = halt_episode(self.broker) or "unknown"
+        # The episode is resolved exactly once: the claim and its release in
+        # ``finally`` must refer to the same one. Re-resolving at release time
+        # can bind to a NEWER episode (halt cleared + re-tripped mid-sweep)
+        # and delete that episode's claim — even a different process's —
+        # which would unprotect a concurrent sweep of the new episode.
         if not claim_sweep(self.broker, episode):
             # Another process holds this episode's claim (or a crash left it
             # behind): the outcome is unknowable — re-sweeping could duplicate
@@ -693,7 +699,7 @@ class LiveRunner:
                 # and are not retryable — latch so a restart does not replay.
                 self._flatten_fired = True
                 try:
-                    mark_sweep_fired(self.broker)
+                    mark_sweep_fired(self.broker, active_episodes)
                 except Exception as persist_exc:  # noqa: BLE001 — double failure
                     # Both the sweep AND the durable latch write failed: the
                     # in-memory flag still shields this process, and the
@@ -762,7 +768,7 @@ class LiveRunner:
                 return
             self._flatten_fired = True
             try:
-                mark_sweep_fired(self.broker)
+                mark_sweep_fired(self.broker, active_episodes)
             except Exception as exc:  # noqa: BLE001 — persistence must not be silent
                 # Durability failure AFTER a broker write: the in-memory flag
                 # protects this process, but a restart sees no latch and could

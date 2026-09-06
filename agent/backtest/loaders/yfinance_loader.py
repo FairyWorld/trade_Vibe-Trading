@@ -62,7 +62,9 @@ def _to_yfinance_symbol(code: str) -> str:
     """
     upper = code.strip().upper()
     if upper.endswith(".US"):
-        return upper[:-3]
+        # US class shares are hyphenated on Yahoo/yfinance (BRK-B): the dot
+        # form returns empty data (live-verified), so map BRK.B.US -> BRK-B.
+        return upper[:-3].replace(".", "-")
     if upper.endswith(".HK"):
         digits = upper[:-3]
         width = max(4, len(digits))
@@ -134,7 +136,9 @@ def _download_history(
         start=start_date,
         end=end_date,
         interval=interval,
-        auto_adjust=False,
+        # Adjusted OHLC like every other loader on the chain (qfq caliber);
+        # volume stays raw on both sides of the comparison.
+        auto_adjust=True,
         progress=False,
     )
 

@@ -41,7 +41,7 @@ describe("StrategyResearchDashboard empty state", () => {
 
   it("also applies for a rebalance_notes-only run", () => {
     render(<StrategyResearchDashboard run={makeRun({
-      rebalance_notes: { summary: { rebalance_count: 3, turnover_total: 0.3, turnover_mean: 0.1, turnover_max: 0.15 } },
+      rebalance_notes: { summary: { target_change_count: 3, turnover_total: 0.3, turnover_mean: 0.1, turnover_max: 0.15 } },
     })} />);
 
     expect(screen.getByText("This run has no backtest data to chart")).toBeInTheDocument();

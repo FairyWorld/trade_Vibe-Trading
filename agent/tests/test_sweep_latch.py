@@ -41,6 +41,12 @@ def _trip_with_timestamp(broker: str | None, tripped_at: str) -> None:
     )
 
 
+def _any_latch_files() -> bool:
+    """True when any per-episode/legacy latch file exists for BROKER."""
+    d = sweep_latch.latch_path(BROKER).parent
+    return any(p.name.startswith("FLATTEN_FIRED") for p in d.glob("FLATTEN_FIRED*"))
+
+
 def test_newer_global_halt_rearms_with_tied_mtimes(live_root: Path) -> None:
     # Regression for the combined-suite flake: broker + global sentinels
     # written within one filesystem timestamp quantum share an mtime.
@@ -81,7 +87,7 @@ def test_fresh_halt_episode_rearms(live_root: Path) -> None:
 
 def test_mark_without_halt_is_noop(live_root: Path) -> None:
     sweep_latch.mark_sweep_fired(BROKER)
-    assert not sweep_latch.latch_path(BROKER).exists()
+    assert not _any_latch_files()
 
 
 def test_hand_touched_halt_binds_via_mtime(live_root: Path) -> None:
@@ -196,7 +202,7 @@ def test_read_failure_does_not_latch_and_restart_replays(live_root: Path) -> Non
 
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER]
-    assert not sweep_latch.latch_path(BROKER).exists()  # nothing persisted
+    assert not sweep_latch.latch_path(BROKER, "2026-08-27T01:00:00+00:00").exists()  # not latched
     # Restart: the failed sweep must re-fire, not be suppressed.
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER, BROKER]
@@ -216,7 +222,7 @@ def test_nothing_to_do_does_not_latch_and_rechecks(live_root: Path) -> None:
 
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER]
-    assert not sweep_latch.latch_path(BROKER).exists()
+    assert not sweep_latch.latch_path(BROKER, "2026-08-27T01:00:00+00:00").exists()
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER, BROKER]
 
@@ -241,7 +247,7 @@ def test_side_effect_attempted_latches_even_with_read_error(
 
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER]
-    assert sweep_latch.latch_path(BROKER).exists()  # latched despite the error
+    assert sweep_latch.latch_path(BROKER, "2026-08-27T01:00:00+00:00").exists()
     # Restart: the on-disk latch suppresses the duplicate close.
     asyncio.run(_build_runner(live_root, fired, _flatten).run_once())
     assert fired == [BROKER]
@@ -316,7 +322,7 @@ def test_runner_claim_released_after_read_failure(live_root: Path) -> None:
     assert fired == [BROKER]
     ep = sweep_latch.halt_episode(BROKER)
     assert not sweep_latch.claim_path(BROKER, ep).exists()
-    assert not sweep_latch.latch_path(BROKER).exists()
+    assert not sweep_latch.latch_path(BROKER, "2026-08-27T01:00:00+00:00").exists()
 
 
 def test_mark_records_both_active_episodes_older_global_newer_broker(
@@ -445,3 +451,60 @@ def test_persistent_read_failure_audits_the_breach_once_per_episode(
     total, kinds = _count_audits(live_root, _flatten, ticks=5)
     assert total == 6, kinds
     assert kinds.count("breach") == 1, kinds
+
+
+def test_mid_sweep_retrip_records_only_swept_episode(live_root: Path) -> None:
+    # Reviewer merge-blocker: the latch must record the episodes the sweep
+    # COVERED (captured before claiming), never what the sentinels say AFTER
+    # the sweep. With a mid-sweep clear + re-trip (ep1 -> ep2), recording ep2
+    # would make the next runner skip it — positions stay open.
+    _trip_with_timestamp(BROKER, "2026-08-27T01:00:00+00:00")
+    fired: list[str] = []
+
+    def _retripping_flatten(broker, submit, read_positions, read_open_orders):
+        fired.append(broker)
+        clear_halt(BROKER)
+        _trip_with_timestamp(BROKER, "2026-08-27T10:00:00+00:00")
+        return {"side_effects_attempted": True}
+
+    asyncio.run(_build_runner(live_root, fired, _retripping_flatten).run_once())
+    # ep1 (the swept episode) is latched; ep2 (never swept) is not.
+    assert sweep_latch.sweep_already_fired(BROKER, "2026-08-27T01:00:00+00:00") is True
+    ep2 = sweep_latch.halt_episode(BROKER)
+    assert ep2 == "2026-08-27T10:00:00+00:00"
+    assert sweep_latch.sweep_already_fired(BROKER, ep2) is False
+    # A subsequent runner must therefore sweep the NEW episode (not skip it).
+    asyncio.run(_build_runner(live_root, fired).run_once())
+    assert fired == [BROKER, BROKER]
+
+
+def test_concurrent_latch_updates_both_episodes_recorded(
+    live_root: Path,
+) -> None:
+    # Reviewer finding 2: two concurrent completions for DIFFERENT episodes
+    # must not lose one another's record (the old shared read-merge-write
+    # could drop an entry). Per-episode latch files make each create
+    # independent — even with true thread interleaving, both must survive.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    barriers = [threading.Barrier(2)]
+    results: list[bool] = []
+
+    def _marker(episode: str, barrier: threading.Barrier) -> None:
+        barrier.wait()
+        sweep_latch.mark_sweep_fired(BROKER, [episode])
+        results.append(True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pool.submit(_marker, "2026-08-27T01:00:00+00:00", barriers[0])
+        pool.submit(_marker, "2026-08-27T10:00:00+00:00", barriers[0])
+    assert len(results) == 2
+    assert (
+        sweep_latch.sweep_already_fired(BROKER, "2026-08-27T01:00:00+00:00")
+        is True
+    )
+    assert (
+        sweep_latch.sweep_already_fired(BROKER, "2026-08-27T10:00:00+00:00")
+        is True
+    )

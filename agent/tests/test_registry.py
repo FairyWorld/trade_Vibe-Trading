@@ -135,7 +135,7 @@ class TestFallbackChains:
         expected = {
             "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
             "ca_equity", "uk_equity", "vietnam_equity", "crypto", "futures",
-            "fund", "macro", "forex",
+            "fund", "macro", "forex", "index",
         }
         assert expected == set(FALLBACK_CHAINS.keys())
 

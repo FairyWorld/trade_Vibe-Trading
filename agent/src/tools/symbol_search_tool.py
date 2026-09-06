@@ -31,6 +31,11 @@ from typing import Any, Dict, List, Optional
 
 from backtest.loaders import eastmoney_client, sec_edgar_client, yahoo_client
 from src.agent.tools import BaseTool
+from src.market_data import FIAT_CODES, canonical_fx_pair
+
+# Back-compat alias: the search tool's historical name for the shared
+# fiat-pair canonicalizer (search, fetch and grounding share one definition).
+_canonical_fx_pair = canonical_fx_pair
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +63,31 @@ _CANADIAN_SYMBOL_RE = re.compile(r"^[A-Z0-9&.\-]+\.(?:TO|V)\b", re.IGNORECASE)
 
 # Explicit exchange-pair spellings are not equity/name searches. Restrict the
 # quote leg to assets used by the built-in crypto connectors so an equity such
-# as ``BRK-B`` is never misclassified as a pair.
-_CRYPTO_QUOTE_ASSETS = (
-    "FDUSD",
-    "USDT",
-    "USDC",
-    "BUSD",
-    "TUSD",
-    "BTC",
-    "ETH",
-    "BNB",
-    "USD",
+# as ``BRK-B`` is never misclassified as a pair. The full set is split into
+# two tiers:
+#
+#   * Stablecoin quotes (FDUSD / USDT / USDC / BUSD / TUSD) are unambiguous -
+#     a ``BTC-USDT`` or ``XAUT-USDC`` cannot be confused with anything outside
+#     crypto. These are accepted on any alphanumeric base.
+#   * ``USD`` is ambiguous: a ``BTC-USD`` is a real Coinbase crypto pair, but
+#     ``XAU-USD`` is spot gold, ``EUR-USD`` is forex, and ``GBP-USD`` is
+#     currency. Restrict ``USD`` to a whitelist of well-known crypto bases
+#     (anything that's actually tradable on Binance/OKX spot, plus the
+#     stablecoin-gold tokens XAUT/PAXG that ARE crypto). Without this guard a
+#     bare ``XAUUSD`` query would lock onto a tokenized-gold row from
+#     Binance instead of the spot gold the user actually asked for.
+_STABLECOIN_QUOTES = ("FDUSD", "USDT", "USDC", "BUSD", "TUSD")
+_CRYPTO_QUOTE_ASSETS = _STABLECOIN_QUOTES + ("BTC", "ETH", "BNB", "USD")
+# Bases that may pair with ``USD`` and still count as a crypto pair. Every
+# entry here is listed on Binance spot or OKX spot; ``XAU``, ``EUR``, etc.
+# are deliberately excluded.
+_CRYPTO_USD_BASES = frozenset(
+    {
+        "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "TRX", "DOT",
+        "MATIC", "AVAX", "LINK", "LTC", "BCH", "ETC", "XLM", "ATOM",
+        "FIL", "APT", "NEAR", "ALGO", "SAND", "MANA", "AXS", "XAUT",
+        "PAXG",
+    }
 )
 _CRYPTO_PAIR_RE = re.compile(
     rf"^([A-Z0-9]{{2,15}})[-/]({'|'.join(_CRYPTO_QUOTE_ASSETS)})$",
@@ -201,8 +220,27 @@ class SymbolSearchTool(BaseTool):
         em_hits, sources["eastmoney"] = _search_eastmoney(query)
         candidates.extend(em_hits)
 
-        yh_hits, sources["yahoo"] = _search_yahoo(query)
+        # An explicit FX pair searches Yahoo by its canonical ``XXXYYY=X``
+        # spelling — exact-symbol search is far more reliable than free text —
+        # and always yields a deterministic candidate, so a throttled/outage
+        # Yahoo (the earlier "GBP/USD -> 0 candidates" failure) never turns a
+        # canonical pair into nothing.
+        fx_pair = _canonical_fx_pair(query)
+        yh_hits, sources["yahoo"] = _search_yahoo(fx_pair or query)
         candidates.extend(yh_hits)
+        if fx_pair is not None:
+            pair_no_x = fx_pair[:-2]
+            candidates.append(
+                {
+                    "symbol": fx_pair,
+                    "name": f"{pair_no_x[:3]}/{pair_no_x[3:]}",
+                    "market": "fx",
+                    "type": "currency",
+                    "exchange": "CCY",
+                    "source": "fx_normalizer",
+                }
+            )
+            sources["fx_normalizer"] = "ok"
 
         if crypto_pair is not None:
             # A pair query is an exact instrument assertion. Near-string Yahoo
@@ -275,15 +313,47 @@ def _is_canadian_symbol(text: str) -> bool:
 
 
 def _canonical_crypto_pair(value: str) -> str | None:
-    """Return an explicit crypto pair in canonical ``BASE-QUOTE`` form."""
+    """Return an explicit crypto pair in canonical ``BASE-QUOTE`` form.
+
+    A pair is only accepted as a crypto pair when its base is in the
+    appropriate whitelist. Stablecoin quotes (``USDT``/``USDC``/``BUSD``/
+    ``TUSD``/``FDUSD``) accept any alphanumeric base — a 6-letter base
+    cannot be confused with a stablecoin because no real-world asset
+    except crypto ones trades quoted in stablecoins. The ``USD`` quote
+    is gated on :data:`_CRYPTO_USD_BASES` so a bare ``XAUUSD`` /
+    ``EURUSD`` / ``GBPUSD`` query does NOT auto-lock onto tokenized gold
+    or a forex pair that the public venue catalogs do not list.
+
+    Returns ``"BASE-QUOTE"`` for an accepted pair, ``None`` otherwise.
+    """
     clean = str(value or "").strip().upper()
     matched = _CRYPTO_PAIR_RE.fullmatch(clean)
     if matched:
-        return f"{matched.group(1)}-{matched.group(2)}"
+        base, quote = matched.group(1), matched.group(2)
+        # Two independent rejections, both required. The fiat/fiat rule (from
+        # main) covers pairs whose quote leg is not USD; the USD whitelist
+        # (this PR) covers a USD quote whose base is not a known crypto —
+        # XAU is not a fiat code, so fiat/fiat alone lets XAU-USD through and
+        # the venue catalog locks tokenized gold as "spot gold".
+        if base in FIAT_CODES and quote in FIAT_CODES:
+            return None  # fiat/fiat is an FX pair, not crypto
+        if quote == "USD" and base not in _CRYPTO_USD_BASES:
+            return None
+        return f"{base}-{quote}"
     if clean.isalnum():
         for quote in _CRYPTO_QUOTE_ASSETS:
             if clean.endswith(quote) and len(clean) > len(quote) + 1:
-                return f"{clean[: -len(quote)]}-{quote}"
+                base = clean[: -len(quote)]
+                # Same two rejections. They differ deliberately in kind:
+                # fiat/fiat has no crypto reading at all, so it gives up;
+                # a non-whitelisted USD base only rules out THIS quote asset,
+                # so it must `continue` and let a longer quote (USDT/USDC)
+                # still match — returning here would strand e.g. XAUT-USDT.
+                if base in FIAT_CODES and quote in FIAT_CODES:
+                    return None  # fiat/fiat is an FX pair, not crypto
+                if quote == "USD" and base not in _CRYPTO_USD_BASES:
+                    continue
+                return f"{base}-{quote}"
     return None
 
 
@@ -667,6 +737,16 @@ def _from_yahoo_symbol(raw_symbol: str, quote: Dict[str, Any]) -> tuple[str, str
     if upper.endswith((".SH", ".SZ", ".BJ")):
         return upper, "cn"
     quote_type = str(quote.get("quoteType") or "").strip().upper()
+    if quote_type == "CURRENCY":
+        # FX pairs canonicalize to the ``XXXYYY=X`` form the fetch layer
+        # serves directly (``GBP/USD`` -> ``GBPUSD=X``); non-fiat currency
+        # quotes (metals like XAU/USD) keep their native symbol.
+        canon = _canonical_fx_pair(raw_symbol)
+        if canon is not None:
+            return canon, "fx"
+        return raw_symbol, "global"
+    if raw_symbol.startswith("^"):
+        return raw_symbol, "index"
     if quote_type == "EQUITY" and "." not in raw_symbol and "-" not in raw_symbol:
         return f"{upper}.US", "us"
     # Crypto, indices, FX, ETFs on non-HK exchanges: keep Yahoo's native symbol.
