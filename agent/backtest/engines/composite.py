@@ -18,6 +18,7 @@ from backtest.engines._market_hooks import (
     _interval_span_hours,
     _is_china_futures,
     _liquidation_mark,
+    _normalize_symbol,
     code_currency,
     calc_crypto_funding_fee,
     check_crypto_liquidation,
@@ -211,20 +212,25 @@ class CompositeEngine(BaseEngine):
 
     def round_size(self, raw_size: float, price: float) -> float:
         """Delegate to active symbol's sub-engine."""
-        return self._rule_for(self._active_symbol).round_size(raw_size, price)
+        sub = self._rule_for(self._active_symbol)
+        # ForexEngine/ChinaFuturesEngine/GlobalFuturesEngine read their OWN
+        # _active_symbol (lot grids, per-symbol fee schedules) — a shared
+        # sub-engine instance keeps whatever symbol last synced it, so it
+        # must be refreshed on every dispatch, not just in apply_slippage.
+        sub._active_symbol = self._active_symbol
+        return sub.round_size(raw_size, price)
 
     def calc_commission(
         self, size: float, price: float, direction: int, is_open: bool,
     ) -> float:
         """Delegate to active symbol's sub-engine."""
-        return self._rule_for(self._active_symbol).calc_commission(
-            size, price, direction, is_open,
-        )
+        sub = self._rule_for(self._active_symbol)
+        sub._active_symbol = self._active_symbol
+        return sub.calc_commission(size, price, direction, is_open)
 
     def apply_slippage(self, price: float, direction: int) -> float:
         """Delegate to active symbol's sub-engine."""
         sub = self._rule_for(self._active_symbol)
-        # ForexEngine needs _active_symbol set on the sub-engine
         sub._active_symbol = self._active_symbol
         return sub.apply_slippage(price, direction)
 
@@ -276,10 +282,13 @@ class CompositeEngine(BaseEngine):
                     self._close_position(symbol, liq_price, timestamp, "liquidation")
 
         elif market == "forex":
+            from backtest.engines.forex import _lot_units
+
             forex_sub = self._rule_engines["forex"]
             if forex_sub.swap_enabled:
                 swap = calc_forex_swap(
                     symbol, timestamp, self.positions,
-                    forex_sub.lot_size, self._last_swap_dates,
+                    _lot_units(_normalize_symbol(symbol), forex_sub.lot_size),
+                    self._last_swap_dates,
                 )
                 self.capital += swap
