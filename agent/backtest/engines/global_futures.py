@@ -94,6 +94,13 @@ _DEFAULT_COMMISSION = 2.50
 
 _MONTH_CODES = set("FGHJKMNQUVXZ")
 
+# Every listed product, for two disambiguation checks _extract_product needs:
+# a bare symbol that already IS a full product name (M2K has a digit in the
+# middle, so the letters-only regexes below can't recognize it on their own),
+# and a product whose own last letter happens to double as a month code
+# (MYM, FESX, FDAX all end in one).
+_KNOWN_PRODUCTS = frozenset(_MULTIPLIER)
+
 
 def _extract_product(symbol: str) -> str:
     """Extract product code from futures symbol.
@@ -104,26 +111,45 @@ def _extract_product(symbol: str) -> str:
       - Product.exchange:            ES.CME
       - Bare product:                ES
 
+    CME currency futures (6E, 6J, 6B, 6A, 6C) start with a digit, so the
+    product group also accepts a single leading digit followed by one
+    letter (e.g. 6EZ4 -> 6E), on top of the plain 2-4 letter form.
+
+    A product whose own last letter is itself a valid month code (MYM,
+    FESX, FDAX) reads as ambiguous in YYMM form: MYM2503 parses just as
+    well as "MY" + June + year 2503 as it does as MYM + YYMM 2503. When
+    that happens, the longer, listed product wins over the coincidental
+    month-code reading. A bare symbol with a digit in the middle of its
+    letters (M2K) cannot be split by the regexes below at all, so it is
+    checked directly against the listed products first.
+
     Args:
         symbol: Futures symbol string.
 
     Returns:
-        Product code (e.g. 'ES', 'CL', 'GC').
+        Product code (e.g. 'ES', 'CL', 'GC', '6E', 'M2K').
     """
     code = symbol.split(".")[0].upper()
 
-    # Pattern 1: product + month-code + year (ESZ4, CLF25, GCM2025)
-    m = re.match(r"([A-Z]{2,4})([FGHJKMNQUVXZ])(\d{1,4})$", code)
+    if code in _KNOWN_PRODUCTS:
+        return code
+
+    # Pattern 1: product + month-code + year (ESZ4, CLF25, GCM2025, 6EZ4)
+    m = re.match(r"(\d[A-Z]|[A-Z]{2,4})([FGHJKMNQUVXZ])(\d{1,4})$", code)
     if m:
+        extended = m.group(1) + m.group(2)
+        rest = code[len(extended) :]
+        if extended in _KNOWN_PRODUCTS and rest.isdigit() and len(rest) == 4:
+            return extended
         return m.group(1)
 
-    # Pattern 2: product + YYMM (NQ2503, CL2412)
-    m = re.match(r"([A-Z]+)(\d{4})$", code)
+    # Pattern 2: product + YYMM (NQ2503, CL2412, 6EH25)
+    m = re.match(r"(\d?[A-Z]+)(\d{4})$", code)
     if m:
         return m.group(1)
 
     # Pattern 3: bare product or fallback
-    m = re.match(r"([A-Z]+)", code)
+    m = re.match(r"(\d?[A-Z]+)", code)
     return m.group(1) if m else code
 
 
