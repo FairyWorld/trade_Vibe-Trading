@@ -406,6 +406,15 @@ Their credentials go to the OS keyring (macOS Keychain, Windows Credential Manag
 
 Most runs follow the same evidence path: route the request, load the right market context, execute tools, validate outputs, and keep the artifacts inspectable.
 
+The agent stops with a visible recovery request after eight consecutive tool-call
+iterations without a new successful observation. Repeating the same read result
+or a failed call does not reset this budget. Identical failed calls are skipped
+until a successful state-changing tool executes or a new run starts; changed
+arguments can still execute. The recovery asks for an artifact path or permission
+to rerun the missing research step, and the run remains failed even if older
+metrics exist. This guard is separate from the wall-clock activity watchdog.
+
+
 | Layer | What happens |
 |-------|--------------|
 | **Plan** | Selects the relevant finance skills, tools, data sources, and swarm preset when useful. |
