@@ -175,12 +175,15 @@ def test_failed_deterministic_call_is_not_cached(agent_factory) -> None:
         agent,
         tool.name,
         run_dir,
-        [{"a": 1}, {"a": 1}, {"a": 2}],
+        [{"a": 1}, {"a": 1}, {"a": 1}, {"a": 2}],
     )
 
-    assert len(tool.calls) == 2  # Changed arguments still execute.
-    assert len(messages) == 3
-    assert json.loads(messages[1]["content"])["skipped"] is True
+    # One honest retry runs (a transient failure says nothing about the
+    # arguments); the THIRD identical attempt is refused, and changed
+    # arguments still execute.
+    assert len(tool.calls) == 3
+    assert len(messages) == 4
+    assert json.loads(messages[2]["content"])["skipped"] is True
     assert not any(r["type"] == "tool_result_cached" for r in records)
 
 

@@ -2126,12 +2126,12 @@ class AgentLoop:
             # un-serialisable call would collapse into a single identity and
             # the second one would be skipped without ever running.
             dedup_key = self._identical_call_key(tc.name, tc.arguments)
-            if dedup_key is not None and dedup_key in self._tool_progress.failed:
+            if dedup_key is not None and self._tool_progress.is_blocked(dedup_key):
                 failed_result = json.dumps(
                     {
                         "status": "error",
                         "skipped": True,
-                        "reason": "This exact call already failed in this run. Change strategy or ask the user for help.",
+                        "reason": "This exact call already failed repeatedly in this run. Change strategy or ask the user for help.",
                     }
                 )
                 self._record_blocked_tool_call(

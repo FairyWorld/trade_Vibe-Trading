@@ -90,7 +90,9 @@ def test_failed_discovery_stops_with_visible_recovery(tmp_path, vary_arguments):
 
     assert result["status"] == "failed"
     assert result["iterations"] == 8
-    assert tool.calls == (8 if vary_arguments else 1)
+    # A repeated identity is refused on the SECOND failure, not the first:
+    # one honest retry runs, the third attempt is blocked.
+    assert tool.calls == (8 if vary_arguments else 2)
     assert "no_progress" in result["reason"]
     assert "path" in result["content"]
     assert "rerun" in result["content"]
@@ -133,7 +135,9 @@ def test_failed_call_ledger_resets_for_a_new_run(tmp_path):
     first = loop.run("Read the artifact.")
     second = loop.run("Try again after I repaired the artifact.")
     assert first["iterations"] == second["iterations"] == 8
-    assert tool.calls == 2
+    # Two executions per run (fail, retry, then blocked), and the second run
+    # starts from an empty ledger rather than inheriting the first run's.
+    assert tool.calls == 4
 
 
 def test_old_metrics_do_not_turn_no_progress_into_success(tmp_path):
@@ -194,3 +198,44 @@ def test_authorization_denial_does_not_poison_an_unexecuted_call(tmp_path):
     loop._process_tool_calls([call], ContextBuilder, messages, trace, [], 2)
     trace.close()
     assert tool.calls == 1
+
+
+def test_a_transient_failure_survives_one_identical_retry(tmp_path):
+    """The case the block is NOT for: a read that fails once for a reason that
+    has nothing to do with its arguments.
+
+    Only a successful *mutating* call clears the failed ledger, and a research
+    run may have none, so refusing on the first failure made a rate limit /
+    network blip / tool timeout permanent for the whole run.
+    """
+    tool = DiscoveryTool(
+        [
+            '{"status":"error","error":"rate limited, retry later"}',
+            '{"status":"ok","data":"artifact"}',
+        ]
+    )
+    loop, _, _ = build_loop(tmp_path, tool, DiscoveryLLM(finish_after=2))
+    result = loop.run("Read the artifact.")
+
+    assert tool.calls == 2, "the identical retry after a transient failure must run"
+    assert result["status"] == "success"
+
+
+def test_failure_block_threshold_is_two_sided():
+    """Both sides of the gate, so a future change cannot quietly move it."""
+    from src.agent.tool_progress import ToolProgress
+
+    progress = ToolProgress()
+    key = ("read_document", '{"path":"missing.csv"}')
+
+    progress.record("read_document", key, '{"status":"error"}', success=False)
+    assert not progress.is_blocked(key), "one failure must not block a retry"
+
+    progress.record("read_document", key, '{"status":"error"}', success=False)
+    assert progress.is_blocked(key), "the second identical failure must block"
+
+    progress.record(
+        "repair_file", ("repair_file", "{}"), '{"status":"ok"}',
+        success=True, is_readonly=False,
+    )
+    assert not progress.is_blocked(key), "a successful mutation clears the ledger"
