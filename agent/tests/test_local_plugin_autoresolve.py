@@ -49,10 +49,34 @@ _MANIFEST: dict[str, Any] = {
 }
 
 
+class _NoSecretsBackend:
+    """Keyring stand-in: no stored secret for anything.
+
+    Without it these tests read the real OS keyring, which exists on a
+    developer laptop and does NOT exist on a CI runner — the suite was green
+    locally and failed on both CI Pythons with ``NoKeyringError``. The store
+    already accepts an injected backend for exactly this reason, and returning
+    no secret is what the assertions want (``configured is False``).
+    """
+
+    def get_password(self, service_name: str, username: str) -> str | None:
+        return None
+
+    def set_password(self, service_name: str, username: str, password: str) -> None:
+        return None
+
+    def delete_password(self, service_name: str, username: str) -> None:
+        return None
+
+
 @pytest.fixture()
 def runtime_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "runtime"
     root.mkdir()
+    monkeypatch.setattr(
+        "src.trading.credentials.CredentialStore.backend",
+        property(lambda self: _NoSecretsBackend()),
+    )
     monkeypatch.setattr("src.trading.connections.get_runtime_root", lambda: root)
     monkeypatch.setattr("src.trading.local_plugins.get_runtime_root", lambda: root)
     plugin_dir = root / "connectors" / "fake"
