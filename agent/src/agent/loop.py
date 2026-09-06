@@ -223,11 +223,21 @@ def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
         total_tokens = input_tokens + output_tokens
     if not (input_tokens or output_tokens or total_tokens):
         return None
-    return {
+    normalized: dict[str, int] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+    details = usage.get("input_token_details")
+    if isinstance(details, dict):
+        if details.get("cache_read") is not None:
+            normalized["cache_read_tokens"] = _coerce_usage_int(details["cache_read"])
+        creation_keys = ("cache_creation", "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+        if any(details.get(key) is not None for key in creation_keys):
+            normalized["cache_creation_tokens"] = sum(
+                _coerce_usage_int(details.get(key)) for key in creation_keys
+            )
+    return normalized
 
 
 def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
@@ -265,6 +275,9 @@ def _record_llm_usage(
     totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
     totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
     totals["calls"] = int(totals.get("calls") or 0) + 1
+    for key in ("cache_read_tokens", "cache_creation_tokens"):
+        if key in normalized:
+            totals[key] = int(totals.get(key) or 0) + normalized[key]
     summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
