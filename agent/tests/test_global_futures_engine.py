@@ -69,6 +69,12 @@ class TestExtractProduct:
             ("6JH25", "6J"),
             ("6B", "6B"),
             ("6A.CME", "6A"),
+            ("M2K", "M2K"),
+            ("MYM2503", "MYM"),
+            ("MYMZ4", "MYM"),
+            ("FESX2503", "FESX"),
+            ("FESXZ4", "FESX"),
+            ("FDAXH25", "FDAX"),
         ],
     )
     def test_extract(self, symbol: str, expected: str) -> None:
@@ -205,6 +211,9 @@ class TestContractMultiplier:
             ("6EZ4", 125000),
             ("6JH25", 12500000),
             ("6B", 62500),
+            ("M2K", 5),
+            ("MYM2503", 0.5),
+            ("FESXZ4", 10),
         ],
     )
     def test_multipliers(self, symbol: str, expected: float) -> None:
