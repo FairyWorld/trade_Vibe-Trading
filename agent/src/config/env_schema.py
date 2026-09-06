@@ -161,6 +161,9 @@ class LLMConfig(_EnvBase):
     vibe_trading_disable_http_proxy: EnvBool = Field(
         alias="VIBE_TRADING_DISABLE_HTTP_PROXY", default=False,
     )
+    vibe_trading_anthropic_prompt_cache: EnvBool = Field(
+        alias="VIBE_TRADING_ANTHROPIC_PROMPT_CACHE", default=True,
+    )
 
 
 # ---------------------------------------------------------------------------
