@@ -233,6 +233,7 @@ class DataConfig(_EnvBase):
     market_data_order_fund: str = Field(alias="MARKET_DATA_ORDER_FUND", default="")
     market_data_order_macro: str = Field(alias="MARKET_DATA_ORDER_MACRO", default="")
     market_data_order_forex: str = Field(alias="MARKET_DATA_ORDER_FOREX", default="")
+    market_data_order_index: str = Field(alias="MARKET_DATA_ORDER_INDEX", default="")
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +421,9 @@ class AgentTuningConfig(_EnvBase):
     )
     vibe_trading_enable_scheduler: EnvBool = Field(
         alias="VIBE_TRADING_ENABLE_SCHEDULER", default=False,
+    )
+    vibe_contextual_identity_constraints: EnvBool = Field(
+        alias="VIBE_CONTEXTUAL_IDENTITY_CONSTRAINTS", default=True,
     )
     vibe_trading_scheduler_max_consecutive_failures: int = Field(
         alias="VIBE_TRADING_SCHEDULER_MAX_CONSECUTIVE_FAILURES", default=3,

@@ -707,6 +707,7 @@ def place_order(
         quantity=float(quantity) if quantity is not None else None,
         instrument_type=instrument_type,
         asset_class=asset_class,
+        limit_price=float(limit_price) if limit_price is not None else None,
     )
     result = execute_live_order(
         broker=profile.connector,
