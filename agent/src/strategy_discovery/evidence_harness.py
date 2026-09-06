@@ -330,14 +330,25 @@ def _month_spans(bar_indices: Sequence[int], dates: Sequence[date]) -> tuple[str
     return tuple(spans)
 
 
-def _bar_returns(bar_indices: Sequence[int], series: Sequence[float]) -> list[float]:
-    """Per-bar simple returns for the given bars (previous bar may be any regime)."""
+def _bar_returns(
+    bar_indices: Sequence[int], series: Sequence[float | None]
+) -> list[float]:
+    """Per-bar simple returns for the given bars (previous bar may be any regime).
+
+    The anchor bar (``index - 1``) is deliberately outside ``bar_indices``,
+    so a caller that verified its OWN bars are present has verified nothing
+    about the anchor: the benchmark series carries ``None`` per bar wherever
+    the column was absent or unparseable. A missing endpoint yields no
+    return for that bar, the same way a non-finite one already does.
+    """
     returns: list[float] = []
     for index in bar_indices:
         if index <= 0:
             continue
         previous = series[index - 1]
         current = series[index]
+        if previous is None or current is None:
+            continue
         if previous <= 0 or not math.isfinite(previous) or not math.isfinite(current):
             continue
         returns.append(current / previous - 1.0)
@@ -509,7 +520,7 @@ def compute_evidence_for_run(
 
         benchmark_compounded: float | None = None
         if all(benchmarks[i] is not None for i in bar_indices):
-            benchmark_returns = _bar_returns(bar_indices, benchmarks)  # type: ignore[arg-type]
+            benchmark_returns = _bar_returns(bar_indices, benchmarks)
             benchmark_compounded = _compounded(benchmark_returns)
         excess = (
             compounded_return - benchmark_compounded

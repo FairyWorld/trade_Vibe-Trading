@@ -75,6 +75,17 @@ class TestExtractProduct:
             ("FESX2503", "FESX"),
             ("FESXZ4", "FESX"),
             ("FDAXH25", "FDAX"),
+            # The dated form of an embedded-digit product: the bare M2K
+            # check cannot see it, and no letters-only group spans "M2K".
+            ("M2KZ4", "M2K"),
+            ("M2K2503", "M2K"),
+            # A listed product that is a prefix of another listed product:
+            # longest match wins, so micro silver stays micro silver.
+            ("SILZ4", "SIL"),
+            ("SIZ4", "SI"),
+            # A product absent from the multiplier table still falls
+            # through to the shape regexes rather than being swallowed.
+            ("6NZ4", "6N"),
         ],
     )
     def test_extract(self, symbol: str, expected: str) -> None:
@@ -214,6 +225,8 @@ class TestContractMultiplier:
             ("M2K", 5),
             ("MYM2503", 0.5),
             ("FESXZ4", 10),
+            ("M2KZ4", 5),
+            ("SILZ4", 1000),
         ],
     )
     def test_multipliers(self, symbol: str, expected: float) -> None:
